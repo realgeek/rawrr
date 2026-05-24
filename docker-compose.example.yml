@@ -3,50 +3,51 @@ version: '3.8'
 services:
   # Example: Rawrr watching for updates
   rawrr:
-    image: rust:latest # In practice, you'd build rawrr as a container
+    build: .
+    image: rawrr:latest
     container_name: rawrr
     environment:
       # Startup delay before first poll (seconds)
       RAWRR_STARTUP_DELAY_SECS: "30"
-      
+
       # How often to poll registries (seconds) - 1 hour default
       RAWRR_POLL_INTERVAL_SECS: "3600"
-      
+
       # Delay between image release and upgrade (hours) - 6 hours default
       RAWRR_RELEASE_DELAY_HOURS: "6"
-      
+
       # Path to state file
       RAWRR_STATE_FILE: "/var/lib/rawrr/state.json"
-      
+
       # Docker socket
       DOCKER_HOST: "unix:///var/run/docker.sock"
-      
+
       # Label names for controlling behavior
       RAWRR_LABEL_IGNORE: "rawrr.ignore"
       RAWRR_LABEL_NOTIFY: "rawrr.notify"
       RAWRR_LABEL_UPDATE: "rawrr.update"
-      
+
       # Notifier: gotify, ntfy, or empty for disabled
       RAWRR_NOTIFIER: "gotify"
       RAWRR_GOTIFY_URL: "http://gotify:80"
       RAWRR_GOTIFY_TOKEN: "your-token-here"
-      
+
       # Alternatively, use ntfy:
       # RAWRR_NOTIFIER: "ntfy"
       # RAWRR_NTFY_URL: "https://ntfy.sh"
       # RAWRR_NTFY_TOPIC: "my-docker-updates"
-      
+
       # Rate limiting
       RAWRR_RATE_LIMIT_MAX_POLLS: "100"
       RAWRR_RATE_LIMIT_WINDOW_SECS: "3600"
-      
+
       # Logging
       RUST_LOG: "rawrr=debug,info"
-    
+
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - rawrr_state:/var/lib/rawrr
-    
+
     restart: unless-stopped
 
   # Example: Service that gets automatically updated
