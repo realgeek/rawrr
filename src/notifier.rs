@@ -110,8 +110,10 @@ async fn send_ntfy(url: &str, topic: &str, notification: &Notification) -> Resul
 }
 
 fn truncate_digest(digest: &str) -> String {
-    if digest.len() > 12 {
-        format!("{}...", &digest[..12])
+    let hash_start = digest.find(':').map(|i| i + 1).unwrap_or(0);
+    let end = (hash_start + 12).min(digest.len());
+    if end < digest.len() {
+        format!("{}…", &digest[..end])
     } else {
         digest.to_string()
     }

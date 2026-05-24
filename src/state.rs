@@ -35,7 +35,7 @@ pub struct RawrrState {
 impl RawrrState {
     pub fn new() -> Self {
         RawrrState {
-            last_poll_time: Utc::now(),
+            last_poll_time: DateTime::UNIX_EPOCH,
             services: HashMap::new(),
         }
     }

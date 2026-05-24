@@ -34,6 +34,10 @@ pub struct Config {
 
     /// Per-registry credentials: registry hostname -> (username, password/token)
     pub registry_credentials: HashMap<String, (String, String)>,
+
+    /// When true, list containers and log their resolved policy, then stop without
+    /// hitting any registry. Useful for verifying label changes.
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +113,11 @@ impl Config {
             &env::var("RAWRR_REGISTRY_CREDENTIALS").unwrap_or_default(),
         );
 
+        let dry_run = matches!(
+            env::var("RAWRR_DRY_RUN").as_deref(),
+            Ok("true") | Ok("1") | Ok("yes")
+        );
+
         Ok(Config {
             state_file,
             startup_delay_secs,
@@ -121,6 +130,7 @@ impl Config {
             rate_limit_max_polls,
             rate_limit_window_secs,
             registry_credentials,
+            dry_run,
         })
     }
     

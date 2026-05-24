@@ -51,6 +51,9 @@ impl Rawrr {
     }
     
     pub async fn run(&mut self) -> Result<()> {
+        if self.config.dry_run {
+            info!("Dry-run mode enabled — will log container policies and exit without hitting registries");
+        }
         info!("Rawrr starting (meow 🐾)");
 
         let mut sigterm = signal(SignalKind::terminate())?;
@@ -81,6 +84,18 @@ impl Rawrr {
     }
     
     async fn poll_and_upgrade(&mut self) {
+        if !self.config.dry_run {
+            let quiet_secs = self.config.poll_interval_secs.saturating_sub(5) as i64;
+            let elapsed = (Utc::now() - self.state.last_poll_time).num_seconds();
+            if elapsed < quiet_secs {
+                info!(
+                    "Last poll was {}s ago, quiet period is {}s — skipping",
+                    elapsed, quiet_secs
+                );
+                return;
+            }
+        }
+
         if !self.rate_limiter.can_poll() {
             let wait_secs = self.rate_limiter.seconds_until_next_poll();
             warn!(
@@ -110,21 +125,37 @@ impl Rawrr {
         
         self.rate_limiter.record_poll();
         self.state.last_poll_time = Utc::now();
-        
+
+        if self.config.dry_run {
+            info!("Dry-run: found {} container(s)", containers.len());
+            for container in &containers {
+                let service_name = container
+                    .names
+                    .first()
+                    .unwrap_or(&container.id)
+                    .trim_start_matches('/')
+                    .to_string();
+                let policy_label = container
+                    .labels
+                    .get(&self.config.label_policy)
+                    .map(|v| v.as_str())
+                    .unwrap_or("(none)");
+                let resolved = match self.get_container_policy(&container.labels) {
+                    Some(ContainerPolicy::Ignore) => "ignore",
+                    Some(ContainerPolicy::Notify) => "notify",
+                    Some(ContainerPolicy::Update) => "update",
+                    None => "(skipped — no recognised policy)",
+                };
+                info!(
+                    "Dry-run:  {:<30}  image={:<45}  label={:<10}  resolved={}",
+                    service_name, container.image, policy_label, resolved
+                );
+            }
+            return;
+        }
+
         // Process each container
         for container in containers {
-            let policy = match self.get_container_policy(&container.labels) {
-                Some(ContainerPolicy::Ignore) => {
-                    debug!("Ignoring container: {}", container.id);
-                    continue;
-                }
-                None => {
-                    debug!("No policy label on container {}, skipping", container.id);
-                    continue;
-                }
-                Some(p) => p,
-            };
-
             let service_name = container
                 .names
                 .first()
@@ -132,9 +163,21 @@ impl Rawrr {
                 .trim_start_matches('/')
                 .to_string();
 
+            let policy = match self.get_container_policy(&container.labels) {
+                Some(ContainerPolicy::Ignore) => {
+                    debug!("Ignoring container: {}", service_name);
+                    continue;
+                }
+                None => {
+                    debug!("No policy label on container {}, skipping", service_name);
+                    continue;
+                }
+                Some(p) => p,
+            };
+
             match self.docker_client.get_image_digest(&container.image).await {
                 Ok(digest) => {
-                    debug!("Container {} has image digest: {}", service_name, digest);
+                    debug!("Container {} has image digest: {}", service_name, short_digest(&digest));
 
                     let old_digest = self.state.services
                         .get(&service_name)
@@ -157,7 +200,7 @@ impl Rawrr {
                 }
             }
         }
-        
+
         // Save state after poll
         if let Err(e) = self.state.save(&self.config.state_file) {
             error!("Failed to save state: {}", e);
@@ -210,6 +253,12 @@ impl Rawrr {
             }
         }
     }
+}
+
+fn short_digest(digest: &str) -> &str {
+    let hash_start = digest.find(':').map(|i| i + 1).unwrap_or(0);
+    let end = (hash_start + 12).min(digest.len());
+    &digest[..end]
 }
 
 #[tokio::main]
