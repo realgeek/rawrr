@@ -33,6 +33,9 @@ pub struct Config {
     pub rate_limit_check_interval_secs: u64,
     pub rate_limit_max_polls: u32,
     pub rate_limit_window_secs: u64,
+
+    /// Per-registry credentials: registry hostname -> (username, password/token)
+    pub registry_credentials: HashMap<String, (String, String)>,
 }
 
 #[derive(Debug, Clone)]
@@ -109,7 +112,11 @@ impl Config {
         let rate_limit_window_secs = env::var("RAWRR_RATE_LIMIT_WINDOW_SECS")
             .unwrap_or_else(|_| "3600".to_string()) // 1 hour window
             .parse()?;
-        
+
+        let registry_credentials = parse_registry_credentials(
+            &env::var("RAWRR_REGISTRY_CREDENTIALS").unwrap_or_default(),
+        );
+
         Ok(Config {
             state_file,
             startup_delay_secs,
@@ -123,10 +130,25 @@ impl Config {
             rate_limit_check_interval_secs,
             rate_limit_max_polls,
             rate_limit_window_secs,
+            registry_credentials,
         })
     }
     
     pub fn get_release_delay(&self) -> Duration {
         Duration::hours(self.release_delay_hours)
     }
+}
+
+// Format: "docker.io=user:token,ghcr.io=user:ghp_token"
+// Splits on the first '=' and first ':' so passwords containing ':' are handled.
+// Commas and '=' are not supported in credentials themselves.
+fn parse_registry_credentials(s: &str) -> HashMap<String, (String, String)> {
+    s.split(',')
+        .filter(|e| !e.is_empty())
+        .filter_map(|entry| {
+            let (registry, creds) = entry.trim().split_once('=')?;
+            let (user, pass) = creds.split_once(':')?;
+            Some((registry.to_string(), (user.to_string(), pass.to_string())))
+        })
+        .collect()
 }

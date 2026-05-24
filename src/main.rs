@@ -27,7 +27,7 @@ pub struct Rawrr {
 
 impl Rawrr {
     pub async fn new(config: Config) -> Result<Self> {
-        let docker_client = DockerClient::new(&config.docker_host)?;
+        let docker_client = DockerClient::new(&config.docker_host, config.registry_credentials.clone())?;
         let state = RawrrState::load(&config.state_file)?;
         
         let rate_limiter = RateLimiter::new(

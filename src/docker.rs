@@ -50,10 +50,11 @@ pub struct DockerClient {
     docker: Docker,
     client: reqwest::Client,
     token_cache: TokenCache,
+    credentials: HashMap<String, (String, String)>,
 }
 
 impl DockerClient {
-    pub fn new(docker_host: &str) -> Result<Self> {
+    pub fn new(docker_host: &str, credentials: HashMap<String, (String, String)>) -> Result<Self> {
         let docker = if docker_host.starts_with("unix://") {
             let path = docker_host.strip_prefix("unix://").unwrap_or("/var/run/docker.sock");
             Docker::connect_with_socket(path, 120, bollard::API_DEFAULT_VERSION)?
@@ -64,6 +65,7 @@ impl DockerClient {
             docker,
             client: reqwest::Client::new(),
             token_cache: TokenCache::new(),
+            credentials,
         })
     }
 
@@ -111,14 +113,14 @@ impl DockerClient {
             _ => format!("https://{}/v2/{}/manifests/{}", registry, repository, tag),
         };
 
-        self.fetch_manifest_digest(&url).await
+        self.fetch_manifest_digest(&url, &registry).await
     }
 
     // Accepts all OCI and Docker manifest types so multi-platform image indexes
     // (application/vnd.oci.image.index.v1+json) are returned alongside single-arch
     // manifests. Registries like lscr.io return 404 if you request only the
     // single-arch type for an image that is stored as an index.
-    async fn fetch_manifest_digest(&self, url: &str) -> Result<String> {
+    async fn fetch_manifest_digest(&self, url: &str, registry: &str) -> Result<String> {
         let response = self
             .client
             .head(url)
@@ -137,6 +139,16 @@ impl DockerClient {
             let (realm, service, scope) = parse_www_authenticate(&www_auth)
                 .ok_or_else(|| anyhow!("Could not parse WWW-Authenticate: {}", www_auth))?;
 
+            // Look up credentials by the image's registry hostname first, then
+            // fall back to the auth service name. The fallback handles cases like
+            // lscr.io whose WWW-Authenticate points to ghcr.io as the service,
+            // so a single ghcr.io credential covers both registries.
+            let creds = self
+                .credentials
+                .get(registry)
+                .or_else(|| self.credentials.get(&service))
+                .map(|(u, p)| (u.as_str(), p.as_str()));
+
             let cache_key = format!("{}|{}|{}", realm, service, scope);
 
             let token = match self.token_cache.get(&cache_key) {
@@ -146,8 +158,13 @@ impl DockerClient {
                 }
                 None => {
                     let (t, ttl) =
-                        fetch_bearer_token(&self.client, &realm, &service, &scope).await?;
-                    debug!("Fetched new token for {} (TTL: {}s)", realm, ttl.as_secs());
+                        fetch_bearer_token(&self.client, &realm, &service, &scope, creds).await?;
+                    debug!(
+                        "Fetched new token for {} (TTL: {}s, authed: {})",
+                        realm,
+                        ttl.as_secs(),
+                        creds.is_some()
+                    );
                     self.token_cache.set(cache_key.clone(), t.clone(), ttl);
                     t
                 }
@@ -197,6 +214,7 @@ async fn fetch_bearer_token(
     realm: &str,
     service: &str,
     scope: &str,
+    credentials: Option<(&str, &str)>,
 ) -> Result<(String, Duration)> {
     let mut url = reqwest::Url::parse(realm)?;
     {
@@ -209,7 +227,12 @@ async fn fetch_bearer_token(
         }
     }
 
-    let body: serde_json::Value = client.get(url).send().await?.json().await?;
+    let request = client.get(url);
+    let request = match credentials {
+        Some((username, password)) => request.basic_auth(username, Some(password)),
+        None => request,
+    };
+    let body: serde_json::Value = request.send().await?.json().await?;
 
     let token = body
         .get("token")
