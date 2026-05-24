@@ -1,8 +1,12 @@
 use anyhow::{anyhow, Result};
+use bollard::container::ListContainersOptions;
+use bollard::Docker;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::collections::HashMap;
-use tracing::{debug, warn};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+use tracing::{debug, info};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Container {
@@ -13,68 +17,411 @@ pub struct Container {
     pub labels: HashMap<String, String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct ImageInfo {
-    pub digest: String,
-    pub created: chrono::DateTime<chrono::Utc>,
+// Keyed by "realm|service|scope". Docker Hub scopes anonymous tokens to the
+// specific repository requested, so a token for repo A is rejected for repo B.
+struct TokenCache(Mutex<HashMap<String, (String, Instant)>>);
+
+impl TokenCache {
+    fn new() -> Self {
+        TokenCache(Mutex::new(HashMap::new()))
+    }
+
+    fn get(&self, key: &str) -> Option<String> {
+        let cache = self.0.lock().unwrap();
+        cache.get(key).and_then(|(token, expires_at)| {
+            if Instant::now() < *expires_at {
+                Some(token.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn set(&self, key: String, token: String, ttl: Duration) {
+        let mut cache = self.0.lock().unwrap();
+        cache.insert(key, (token, Instant::now() + ttl));
+    }
+
+    fn evict(&self, key: &str) {
+        self.0.lock().unwrap().remove(key);
+    }
 }
 
 pub struct DockerClient {
+    docker: Docker,
     client: reqwest::Client,
-    socket_path: String,
+    token_cache: TokenCache,
+    credentials: HashMap<String, (String, String)>,
 }
 
 impl DockerClient {
-    pub fn new(docker_host: &str) -> Result<Self> {
-        // For unix sockets, we'll use the socket_path from DOCKER_HOST
-        // Format: unix:///var/run/docker.sock
-        let socket_path = if docker_host.starts_with("unix://") {
-            docker_host.strip_prefix("unix://").unwrap_or("/var/run/docker.sock").to_string()
+    pub fn new(docker_host: &str, credentials: HashMap<String, (String, String)>) -> Result<Self> {
+        let docker = if docker_host.starts_with("unix://") {
+            let path = docker_host.strip_prefix("unix://").unwrap_or("/var/run/docker.sock");
+            Docker::connect_with_socket(path, 120, bollard::API_DEFAULT_VERSION)?
         } else {
-            docker_host.to_string()
+            Docker::connect_with_http(docker_host, 120, bollard::API_DEFAULT_VERSION)?
         };
-        
-        let client = reqwest::Client::new();
-        
         Ok(DockerClient {
-            client,
-            socket_path,
+            docker,
+            client: reqwest::Client::new(),
+            token_cache: TokenCache::new(),
+            credentials,
         })
     }
-    
+
     pub async fn list_containers(&self) -> Result<Vec<Container>> {
-        // This is a simplified version - in production you'd use docker-rs or similar
-        // For now, we'll use the Docker API via HTTP over Unix socket
-        // This requires special handling that's beyond a simple HTTP client
-        
-        // As a fallback for demonstration, we'll return an empty list
-        // In real usage, integrate with docker-rs crate
-        debug!("Listing containers from socket: {}", self.socket_path);
-        
-        // TODO: Implement proper Unix socket communication
-        // For now, this is a placeholder
-        Ok(vec![])
+        let summaries = self
+            .docker
+            .list_containers(Some(ListContainersOptions::<String> {
+                all: false,
+                ..Default::default()
+            }))
+            .await?;
+
+        Ok(summaries
+            .into_iter()
+            .map(|c| Container {
+                id: c.id.unwrap_or_default(),
+                names: c.names.unwrap_or_default(),
+                image: c.image.unwrap_or_default(),
+                image_id: c.image_id.unwrap_or_default(),
+                labels: c.labels.unwrap_or_default(),
+            })
+            .collect())
     }
-    
+
     pub async fn inspect_container(&self, container_id: &str) -> Result<Container> {
-        // TODO: Implement inspection
-        Err(anyhow!("Not yet implemented"))
+        let info = self.docker.inspect_container(container_id, None).await?;
+        let config = info.config.unwrap_or_default();
+        Ok(Container {
+            id: info.id.unwrap_or_default(),
+            names: info.name.map(|n| vec![n]).unwrap_or_default(),
+            image: config.image.unwrap_or_default(),
+            image_id: info.image.unwrap_or_default(),
+            labels: config.labels.unwrap_or_default(),
+        })
     }
-    
+
     pub async fn get_image_digest(&self, image_ref: &str) -> Result<String> {
-        // Query registry for image digest
-        // This would hit Docker Hub, ECR, GitHub Container Registry, etc.
         debug!("Getting image digest for: {}", image_ref);
-        
-        // Parse the image reference
         let (registry, repository, tag) = parse_image_ref(image_ref)?;
-        
-        match registry.as_str() {
-            "docker.io" | "" => get_docker_hub_digest(&repository, &tag).await,
-            "ghcr.io" => get_github_digest(&repository, &tag).await,
-            _ => get_generic_digest(&registry, &repository, &tag).await,
+
+        let url = match registry.as_str() {
+            "docker.io" | "" => {
+                format!("https://registry-1.docker.io/v2/{}/manifests/{}", repository, tag)
+            }
+            _ => format!("https://{}/v2/{}/manifests/{}", registry, repository, tag),
+        };
+
+        self.fetch_manifest_digest(&url, &registry).await
+    }
+
+    // Accepts all OCI and Docker manifest types so multi-platform image indexes
+    // (application/vnd.oci.image.index.v1+json) are returned alongside single-arch
+    // manifests. Registries like lscr.io return 404 if you request only the
+    // single-arch type for an image that is stored as an index.
+    async fn fetch_manifest_digest(&self, url: &str, registry: &str) -> Result<String> {
+        let response = self
+            .client
+            .head(url)
+            .header("Accept", ACCEPT_MANIFESTS)
+            .send()
+            .await?;
+
+        let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let www_auth = response
+                .headers()
+                .get("WWW-Authenticate")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string())
+                .ok_or_else(|| anyhow!("401 with no WWW-Authenticate header"))?;
+
+            let (realm, service, scope) = parse_www_authenticate(&www_auth)
+                .ok_or_else(|| anyhow!("Could not parse WWW-Authenticate: {}", www_auth))?;
+
+            // Look up credentials by the image's registry hostname first, then
+            // fall back to the auth service name. The fallback handles cases like
+            // lscr.io whose WWW-Authenticate points to ghcr.io as the service,
+            // so a single ghcr.io credential covers both registries.
+            let creds = self
+                .credentials
+                .get(registry)
+                .or_else(|| self.credentials.get(&service))
+                .map(|(u, p)| (u.as_str(), p.as_str()));
+
+            let cache_key = format!("{}|{}|{}", realm, service, scope);
+
+            let token = match self.token_cache.get(&cache_key) {
+                Some(t) => {
+                    debug!("Using cached token for {}", realm);
+                    t
+                }
+                None => {
+                    let (t, ttl) =
+                        fetch_bearer_token(&self.client, &realm, &service, &scope, creds).await?;
+                    debug!(
+                        "Fetched new token for {} (TTL: {}s, authed: {})",
+                        realm,
+                        ttl.as_secs(),
+                        creds.is_some()
+                    );
+                    self.token_cache.set(cache_key.clone(), t.clone(), ttl);
+                    t
+                }
+            };
+
+            let retry = self
+                .client
+                .head(url)
+                .header("Accept", ACCEPT_MANIFESTS)
+                .header("Authorization", format!("Bearer {}", token))
+                .send()
+                .await?;
+
+            // Evict on 401 so the next poll fetches a fresh token rather than
+            // retrying with a stale one indefinitely.
+            if retry.status() == reqwest::StatusCode::UNAUTHORIZED {
+                self.token_cache.evict(&cache_key);
+            }
+
+            retry
+        } else {
+            response
+        };
+
+        if !response.status().is_success() {
+            return Err(anyhow!("Registry request failed: {}", response.status()));
+        }
+
+        response
+            .headers()
+            .get("Docker-Content-Digest")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("No Docker-Content-Digest header in response"))
+    }
+
+    /// Returns the registry digest stored in the local image's RepoDigests, i.e. the
+    /// `sha256:…` portion of entries like `nginx@sha256:…`. This is the same value
+    /// the registry returns in the Docker-Content-Digest header, so it can be compared
+    /// directly with the result of `get_image_digest`.
+    pub async fn get_local_image_digest(&self, image_id: &str) -> Result<Option<String>> {
+        let info = self.docker.inspect_image(image_id).await?;
+        Ok(info
+            .repo_digests
+            .unwrap_or_default()
+            .into_iter()
+            .find_map(|d| d.split_once('@').map(|(_, digest)| digest.to_string())))
+    }
+
+    pub async fn pull_image(&self, image: &str) -> Result<()> {
+        use bollard::image::CreateImageOptions;
+
+        let (registry, _, _) = parse_image_ref(image)?;
+        let auth = self.credentials.get(&registry).map(|(username, password)| {
+            bollard::auth::DockerCredentials {
+                username: Some(username.clone()),
+                password: Some(password.clone()),
+                serveraddress: Some(registry.clone()),
+                ..Default::default()
+            }
+        });
+
+        let (from_image, tag) = match image.rfind(':') {
+            Some(i) => (&image[..i], &image[i + 1..]),
+            None => (image, "latest"),
+        };
+
+        info!("Pulling image {}", image);
+        let mut stream = self.docker.create_image(
+            Some(CreateImageOptions { from_image, tag, ..Default::default() }),
+            None,
+            auth,
+        );
+        while let Some(result) = stream.next().await {
+            result?;
+        }
+        Ok(())
+    }
+
+    pub async fn recreate_container(&self, container_id: &str) -> Result<()> {
+        use bollard::container::{
+            Config, CreateContainerOptions, RemoveContainerOptions, StopContainerOptions,
+        };
+        use bollard::models::EndpointSettings;
+        use bollard::network::ConnectNetworkOptions;
+
+        let info = self.docker.inspect_container(container_id, None).await?;
+        let name = info
+            .name
+            .as_deref()
+            .unwrap_or("")
+            .trim_start_matches('/')
+            .to_string();
+
+        let container_config = info
+            .config
+            .clone()
+            .ok_or_else(|| anyhow!("No config in inspect response for {}", name))?;
+
+        let primary_network = info
+            .host_config
+            .as_ref()
+            .and_then(|hc| hc.network_mode.clone())
+            .unwrap_or_else(|| "bridge".to_string());
+
+        // Collect any networks beyond the primary one — connect to these after recreation
+        let extra_networks: Vec<String> = info
+            .network_settings
+            .as_ref()
+            .and_then(|ns| ns.networks.as_ref())
+            .map(|nets| {
+                nets.keys()
+                    .filter(|n| {
+                        !matches!(n.as_str(), "bridge" | "host" | "none")
+                            && **n != primary_network
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        info!("Stopping container {}", name);
+        self.docker
+            .stop_container(container_id, Some(StopContainerOptions { t: 10 }))
+            .await?;
+
+        info!("Removing container {}", name);
+        self.docker
+            .remove_container(
+                container_id,
+                Some(RemoveContainerOptions { force: false, v: false, link: false }),
+            )
+            .await?;
+
+        let create_config = Config {
+            hostname: container_config.hostname,
+            domainname: container_config.domainname,
+            user: container_config.user,
+            attach_stdin: container_config.attach_stdin,
+            attach_stdout: container_config.attach_stdout,
+            attach_stderr: container_config.attach_stderr,
+            exposed_ports: container_config.exposed_ports,
+            tty: container_config.tty,
+            open_stdin: container_config.open_stdin,
+            stdin_once: container_config.stdin_once,
+            env: container_config.env,
+            cmd: container_config.cmd,
+            image: container_config.image,
+            volumes: container_config.volumes,
+            working_dir: container_config.working_dir,
+            entrypoint: container_config.entrypoint,
+            labels: container_config.labels,
+            stop_signal: container_config.stop_signal,
+            stop_timeout: container_config.stop_timeout,
+            host_config: info.host_config,
+            ..Default::default()
+        };
+
+        info!("Creating container {}", name);
+        let created = self
+            .docker
+            .create_container(
+                Some(CreateContainerOptions::<String> {
+                    name: name.clone(),
+                    platform: None,
+                }),
+                create_config,
+            )
+            .await?;
+
+        for network_name in &extra_networks {
+            info!("Connecting {} to network {}", name, network_name);
+            self.docker
+                .connect_network(
+                    network_name,
+                    ConnectNetworkOptions::<String> {
+                        container: created.id.clone(),
+                        endpoint_config: EndpointSettings::default(),
+                    },
+                )
+                .await?;
+        }
+
+        info!("Starting container {}", name);
+        self.docker
+            .start_container::<String>(&created.id, None)
+            .await?;
+
+        Ok(())
+    }
+}
+
+const ACCEPT_MANIFESTS: &str = concat!(
+    "application/vnd.oci.image.index.v1+json,",
+    "application/vnd.oci.image.manifest.v1+json,",
+    "application/vnd.docker.distribution.manifest.list.v2+json,",
+    "application/vnd.docker.distribution.manifest.v2+json"
+);
+
+async fn fetch_bearer_token(
+    client: &reqwest::Client,
+    realm: &str,
+    service: &str,
+    scope: &str,
+    credentials: Option<(&str, &str)>,
+) -> Result<(String, Duration)> {
+    let mut url = reqwest::Url::parse(realm)?;
+    {
+        let mut q = url.query_pairs_mut();
+        if !service.is_empty() {
+            q.append_pair("service", service);
+        }
+        if !scope.is_empty() {
+            q.append_pair("scope", scope);
         }
     }
+
+    let request = client.get(url);
+    let request = match credentials {
+        Some((username, password)) => request.basic_auth(username, Some(password)),
+        None => request,
+    };
+    let body: serde_json::Value = request.send().await?.json().await?;
+
+    let token = body
+        .get("token")
+        .or_else(|| body.get("access_token"))
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("No token field in auth response"))?;
+
+    // Subtract 30s from the registry's stated TTL as a clock-skew buffer.
+    // Default to 270s (4.5 min) if expires_in is absent.
+    let ttl = body
+        .get("expires_in")
+        .and_then(|e| e.as_u64())
+        .map(|secs| Duration::from_secs(secs.saturating_sub(30)))
+        .unwrap_or(Duration::from_secs(270));
+
+    Ok((token, ttl))
+}
+
+fn parse_www_authenticate(header: &str) -> Option<(String, String, String)> {
+    let params = header.strip_prefix("Bearer ")?;
+    let realm = extract_quoted_param(params, "realm")?;
+    let service = extract_quoted_param(params, "service").unwrap_or_default();
+    let scope = extract_quoted_param(params, "scope").unwrap_or_default();
+    Some((realm, service, scope))
+}
+
+fn extract_quoted_param(params: &str, key: &str) -> Option<String> {
+    let needle = format!("{}=\"", key);
+    let start = params.find(&needle)? + needle.len();
+    let rest = &params[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 fn parse_image_ref(image: &str) -> Result<(String, String, String)> {
@@ -84,97 +431,25 @@ fn parse_image_ref(image: &str) -> Result<(String, String, String)> {
     } else {
         (image, "latest".to_string())
     };
-    
+
     let (registry, repo) = if let Some(slash) = name.find('/') {
         let (reg, r) = name.split_at(slash);
         if reg.contains('.') || reg.contains(':') {
-            // It's a registry
             (reg.to_string(), r.trim_start_matches('/').to_string())
         } else {
-            // It's a namespace on Docker Hub
             ("docker.io".to_string(), name.to_string())
         }
     } else {
-        // Just a name on Docker Hub
         ("docker.io".to_string(), format!("library/{}", name))
     };
-    
+
     Ok((registry, repo, tag))
-}
-
-async fn get_docker_hub_digest(repository: &str, tag: &str) -> Result<String> {
-    // Docker Hub V2 API
-    let url = format!("https://registry.hub.docker.com/v2/{}/manifests/{}", repository, tag);
-    
-    let client = reqwest::Client::new();
-    let response = client
-        .head(&url)
-        .header("Accept", "application/vnd.docker.distribution.manifest.v2+json")
-        .send()
-        .await?;
-    
-    if !response.status().is_success() {
-        return Err(anyhow!("Failed to get Docker Hub digest: {}", response.status()));
-    }
-    
-    response
-        .headers()
-        .get("Docker-Content-Digest")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("No Docker-Content-Digest header found"))
-}
-
-async fn get_github_digest(repository: &str, tag: &str) -> Result<String> {
-    // GitHub Container Registry
-    let url = format!("https://ghcr.io/v2/{}/manifests/{}", repository, tag);
-    
-    let client = reqwest::Client::new();
-    let response = client
-        .head(&url)
-        .header("Accept", "application/vnd.oci.image.manifest.v1+json")
-        .send()
-        .await?;
-    
-    if !response.status().is_success() {
-        return Err(anyhow!("Failed to get GHCR digest: {}", response.status()));
-    }
-    
-    response
-        .headers()
-        .get("Docker-Content-Digest")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("No Docker-Content-Digest header found"))
-}
-
-async fn get_generic_digest(registry: &str, repository: &str, tag: &str) -> Result<String> {
-    // Generic OCI registry
-    let url = format!("https://{}/v2/{}/manifests/{}", registry, repository, tag);
-    
-    let client = reqwest::Client::new();
-    let response = client
-        .head(&url)
-        .header("Accept", "application/vnd.oci.image.manifest.v1+json")
-        .send()
-        .await?;
-    
-    if !response.status().is_success() {
-        return Err(anyhow!("Failed to get digest from {}: {}", registry, response.status()));
-    }
-    
-    response
-        .headers()
-        .get("Docker-Content-Digest")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("No Docker-Content-Digest header found"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_parse_docker_hub_default() {
         let (reg, repo, tag) = parse_image_ref("nginx").unwrap();
@@ -182,7 +457,7 @@ mod tests {
         assert_eq!(repo, "library/nginx");
         assert_eq!(tag, "latest");
     }
-    
+
     #[test]
     fn test_parse_docker_hub_with_tag() {
         let (reg, repo, tag) = parse_image_ref("nginx:1.25").unwrap();
@@ -190,7 +465,7 @@ mod tests {
         assert_eq!(repo, "library/nginx");
         assert_eq!(tag, "1.25");
     }
-    
+
     #[test]
     fn test_parse_docker_hub_with_namespace() {
         let (reg, repo, tag) = parse_image_ref("myorg/myapp:v1.2.3").unwrap();
@@ -198,12 +473,21 @@ mod tests {
         assert_eq!(repo, "myorg/myapp");
         assert_eq!(tag, "v1.2.3");
     }
-    
+
     #[test]
     fn test_parse_ghcr() {
         let (reg, repo, tag) = parse_image_ref("ghcr.io/myorg/myapp:latest").unwrap();
         assert_eq!(reg, "ghcr.io");
         assert_eq!(repo, "myorg/myapp");
         assert_eq!(tag, "latest");
+    }
+
+    #[test]
+    fn test_parse_www_authenticate() {
+        let header = r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/nginx:pull""#;
+        let (realm, service, scope) = parse_www_authenticate(header).unwrap();
+        assert_eq!(realm, "https://auth.docker.io/token");
+        assert_eq!(service, "registry.docker.io");
+        assert_eq!(scope, "repository:library/nginx:pull");
     }
 }

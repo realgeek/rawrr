@@ -30,7 +30,7 @@ A Rust-based Docker image update watcher that monitors your containers for new i
 ### Build from Source
 
 ```bash
-git clone https://github.com/yourusername/rawrr.git
+git clone https://github.com/realgeek/rawrr.git
 cd rawrr
 cargo build --release
 ./target/release/rawrr
@@ -38,15 +38,11 @@ cargo build --release
 
 ### Docker
 
-```dockerfile
-FROM rust:latest as builder
-WORKDIR /app
-COPY . .
-RUN cargo build --release
+A `Dockerfile` is included in the repository. It uses a multi-stage Alpine build, producing a small static binary with no OpenSSL dependency:
 
-FROM debian:bookworm-slim
-COPY --from=builder /app/target/release/rawrr /usr/local/bin/
-ENTRYPOINT ["rawrr"]
+```bash
+docker build -t rawrr:latest .
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock rawrr:latest
 ```
 
 ## Configuration
@@ -277,7 +273,7 @@ ls -la /var/lib/rawrr/
 
 ## Future Enhancements
 
-- [ ] Actual Docker container restart implementation
+- [ ] Container restart implementation (pull new image, stop/start container)
 - [ ] Support for docker-compose orchestration
 - [ ] Additional notifiers (Slack, PagerDuty, email)
 - [ ] Webhook support for registries

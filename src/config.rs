@@ -21,10 +21,8 @@ pub struct Config {
     /// Docker socket or remote endpoint
     pub docker_host: String,
     
-    /// Container labels that determine behavior
-    pub label_ignore: String,
-    pub label_notify: String,
-    pub label_update: String,
+    /// Container label that controls monitoring policy
+    pub label_policy: String,
     
     /// Notification settings
     pub notifier: NotifierConfig,
@@ -33,6 +31,13 @@ pub struct Config {
     pub rate_limit_check_interval_secs: u64,
     pub rate_limit_max_polls: u32,
     pub rate_limit_window_secs: u64,
+
+    /// Per-registry credentials: registry hostname -> (username, password/token)
+    pub registry_credentials: HashMap<String, (String, String)>,
+
+    /// When true, list containers and log their resolved policy, then stop without
+    /// hitting any registry. Useful for verifying label changes.
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -71,14 +76,8 @@ impl Config {
         let docker_host = env::var("DOCKER_HOST")
             .unwrap_or_else(|_| "unix:///var/run/docker.sock".to_string());
         
-        let label_ignore = env::var("RAWRR_LABEL_IGNORE")
-            .unwrap_or_else(|_| "rawrr.ignore".to_string());
-        
-        let label_notify = env::var("RAWRR_LABEL_NOTIFY")
-            .unwrap_or_else(|_| "rawrr.notify".to_string());
-        
-        let label_update = env::var("RAWRR_LABEL_UPDATE")
-            .unwrap_or_else(|_| "rawrr.update".to_string());
+        let label_policy = env::var("RAWRR_LABEL_POLICY")
+            .unwrap_or_else(|_| "rawrr.policy".to_string());
         
         let notifier = match env::var("RAWRR_NOTIFIER").as_deref() {
             Ok("gotify") => {
@@ -109,24 +108,47 @@ impl Config {
         let rate_limit_window_secs = env::var("RAWRR_RATE_LIMIT_WINDOW_SECS")
             .unwrap_or_else(|_| "3600".to_string()) // 1 hour window
             .parse()?;
-        
+
+        let registry_credentials = parse_registry_credentials(
+            &env::var("RAWRR_REGISTRY_CREDENTIALS").unwrap_or_default(),
+        );
+
+        let dry_run = matches!(
+            env::var("RAWRR_DRY_RUN").as_deref(),
+            Ok("true") | Ok("1") | Ok("yes")
+        );
+
         Ok(Config {
             state_file,
             startup_delay_secs,
             poll_interval_secs,
             release_delay_hours,
             docker_host,
-            label_ignore,
-            label_notify,
-            label_update,
+            label_policy,
             notifier,
             rate_limit_check_interval_secs,
             rate_limit_max_polls,
             rate_limit_window_secs,
+            registry_credentials,
+            dry_run,
         })
     }
     
     pub fn get_release_delay(&self) -> Duration {
         Duration::hours(self.release_delay_hours)
     }
+}
+
+// Format: "docker.io=user:token,ghcr.io=user:ghp_token"
+// Splits on the first '=' and first ':' so passwords containing ':' are handled.
+// Commas and '=' are not supported in credentials themselves.
+fn parse_registry_credentials(s: &str) -> HashMap<String, (String, String)> {
+    s.split(',')
+        .filter(|e| !e.is_empty())
+        .filter_map(|entry| {
+            let (registry, creds) = entry.trim().split_once('=')?;
+            let (user, pass) = creds.split_once(':')?;
+            Some((registry.to_string(), (user.to_string(), pass.to_string())))
+        })
+        .collect()
 }
