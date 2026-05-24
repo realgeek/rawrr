@@ -3,6 +3,8 @@ use bollard::container::ListContainersOptions;
 use bollard::Docker;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 use tracing::debug;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14,9 +16,40 @@ pub struct Container {
     pub labels: HashMap<String, String>,
 }
 
+// Keyed by "realm|service". The scope is per-image but anonymous tokens are
+// valid for any repo on that registry, so we only need one token per endpoint.
+struct TokenCache(Mutex<HashMap<String, (String, Instant)>>);
+
+impl TokenCache {
+    fn new() -> Self {
+        TokenCache(Mutex::new(HashMap::new()))
+    }
+
+    fn get(&self, key: &str) -> Option<String> {
+        let cache = self.0.lock().unwrap();
+        cache.get(key).and_then(|(token, expires_at)| {
+            if Instant::now() < *expires_at {
+                Some(token.clone())
+            } else {
+                None
+            }
+        })
+    }
+
+    fn set(&self, key: String, token: String, ttl: Duration) {
+        let mut cache = self.0.lock().unwrap();
+        cache.insert(key, (token, Instant::now() + ttl));
+    }
+
+    fn evict(&self, key: &str) {
+        self.0.lock().unwrap().remove(key);
+    }
+}
+
 pub struct DockerClient {
     docker: Docker,
     client: reqwest::Client,
+    token_cache: TokenCache,
 }
 
 impl DockerClient {
@@ -30,6 +63,7 @@ impl DockerClient {
         Ok(DockerClient {
             docker,
             client: reqwest::Client::new(),
+            token_cache: TokenCache::new(),
         })
     }
 
@@ -77,14 +111,80 @@ impl DockerClient {
             _ => format!("https://{}/v2/{}/manifests/{}", registry, repository, tag),
         };
 
-        get_manifest_digest(&self.client, &url).await
+        self.fetch_manifest_digest(&url).await
+    }
+
+    // Accepts all OCI and Docker manifest types so multi-platform image indexes
+    // (application/vnd.oci.image.index.v1+json) are returned alongside single-arch
+    // manifests. Registries like lscr.io return 404 if you request only the
+    // single-arch type for an image that is stored as an index.
+    async fn fetch_manifest_digest(&self, url: &str) -> Result<String> {
+        let response = self
+            .client
+            .head(url)
+            .header("Accept", ACCEPT_MANIFESTS)
+            .send()
+            .await?;
+
+        let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let www_auth = response
+                .headers()
+                .get("WWW-Authenticate")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string())
+                .ok_or_else(|| anyhow!("401 with no WWW-Authenticate header"))?;
+
+            let (realm, service, scope) = parse_www_authenticate(&www_auth)
+                .ok_or_else(|| anyhow!("Could not parse WWW-Authenticate: {}", www_auth))?;
+
+            let cache_key = format!("{}|{}", realm, service);
+
+            let token = match self.token_cache.get(&cache_key) {
+                Some(t) => {
+                    debug!("Using cached token for {}", realm);
+                    t
+                }
+                None => {
+                    let (t, ttl) =
+                        fetch_bearer_token(&self.client, &realm, &service, &scope).await?;
+                    debug!("Fetched new token for {} (TTL: {}s)", realm, ttl.as_secs());
+                    self.token_cache.set(cache_key.clone(), t.clone(), ttl);
+                    t
+                }
+            };
+
+            let retry = self
+                .client
+                .head(url)
+                .header("Accept", ACCEPT_MANIFESTS)
+                .header("Authorization", format!("Bearer {}", token))
+                .send()
+                .await?;
+
+            // Evict on 401 so the next poll fetches a fresh token rather than
+            // retrying with a stale one indefinitely.
+            if retry.status() == reqwest::StatusCode::UNAUTHORIZED {
+                self.token_cache.evict(&cache_key);
+            }
+
+            retry
+        } else {
+            response
+        };
+
+        if !response.status().is_success() {
+            return Err(anyhow!("Registry request failed: {}", response.status()));
+        }
+
+        response
+            .headers()
+            .get("Docker-Content-Digest")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("No Docker-Content-Digest header in response"))
     }
 }
 
-// Accepts all OCI and Docker manifest types so multi-platform image indexes
-// (application/vnd.oci.image.index.v1+json) are returned alongside single-arch
-// manifests. Registries like lscr.io return 404 if you request only the
-// single-arch type for an image that is stored as an index.
 const ACCEPT_MANIFESTS: &str = concat!(
     "application/vnd.oci.image.index.v1+json,",
     "application/vnd.oci.image.manifest.v1+json,",
@@ -92,53 +192,12 @@ const ACCEPT_MANIFESTS: &str = concat!(
     "application/vnd.docker.distribution.manifest.v2+json"
 );
 
-// Fetches a manifest digest, handling the standard OCI Bearer token challenge.
-// All OCI-compliant registries (Docker Hub, GHCR, lscr.io, etc.) return 401 on
-// the first request with a WWW-Authenticate header pointing to their token endpoint.
-async fn get_manifest_digest(client: &reqwest::Client, url: &str) -> Result<String> {
-    let response = client.head(url).header("Accept", ACCEPT_MANIFESTS).send().await?;
-
-    let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-        let www_auth = response
-            .headers()
-            .get("WWW-Authenticate")
-            .and_then(|h| h.to_str().ok())
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("401 with no WWW-Authenticate header"))?;
-
-        let (realm, service, scope) = parse_www_authenticate(&www_auth)
-            .ok_or_else(|| anyhow!("Could not parse WWW-Authenticate: {}", www_auth))?;
-
-        let token = fetch_bearer_token(client, &realm, &service, &scope).await?;
-
-        client
-            .head(url)
-            .header("Accept", ACCEPT_MANIFESTS)
-            .header("Authorization", format!("Bearer {}", token))
-            .send()
-            .await?
-    } else {
-        response
-    };
-
-    if !response.status().is_success() {
-        return Err(anyhow!("Registry request failed: {}", response.status()));
-    }
-
-    response
-        .headers()
-        .get("Docker-Content-Digest")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("No Docker-Content-Digest header in response"))
-}
-
 async fn fetch_bearer_token(
     client: &reqwest::Client,
     realm: &str,
     service: &str,
     scope: &str,
-) -> Result<String> {
+) -> Result<(String, Duration)> {
     let mut url = reqwest::Url::parse(realm)?;
     {
         let mut q = url.query_pairs_mut();
@@ -152,11 +211,22 @@ async fn fetch_bearer_token(
 
     let body: serde_json::Value = client.get(url).send().await?.json().await?;
 
-    body.get("token")
+    let token = body
+        .get("token")
         .or_else(|| body.get("access_token"))
         .and_then(|t| t.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("No token field in auth response"))
+        .ok_or_else(|| anyhow!("No token field in auth response"))?;
+
+    // Subtract 30s from the registry's stated TTL as a clock-skew buffer.
+    // Default to 270s (4.5 min) if expires_in is absent.
+    let ttl = body
+        .get("expires_in")
+        .and_then(|e| e.as_u64())
+        .map(|secs| Duration::from_secs(secs.saturating_sub(30)))
+        .unwrap_or(Duration::from_secs(270));
+
+    Ok((token, ttl))
 }
 
 fn parse_www_authenticate(header: &str) -> Option<(String, String, String)> {
