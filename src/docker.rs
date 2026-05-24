@@ -1,11 +1,12 @@
 use anyhow::{anyhow, Result};
 use bollard::container::ListContainersOptions;
 use bollard::Docker;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tracing::debug;
+use tracing::{debug, info};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Container {
@@ -199,6 +200,161 @@ impl DockerClient {
             .and_then(|h| h.to_str().ok())
             .map(|s| s.to_string())
             .ok_or_else(|| anyhow!("No Docker-Content-Digest header in response"))
+    }
+
+    /// Returns the registry digest stored in the local image's RepoDigests, i.e. the
+    /// `sha256:…` portion of entries like `nginx@sha256:…`. This is the same value
+    /// the registry returns in the Docker-Content-Digest header, so it can be compared
+    /// directly with the result of `get_image_digest`.
+    pub async fn get_local_image_digest(&self, image_id: &str) -> Result<Option<String>> {
+        let info = self.docker.inspect_image(image_id).await?;
+        Ok(info
+            .repo_digests
+            .unwrap_or_default()
+            .into_iter()
+            .find_map(|d| d.split_once('@').map(|(_, digest)| digest.to_string())))
+    }
+
+    pub async fn pull_image(&self, image: &str) -> Result<()> {
+        use bollard::image::CreateImageOptions;
+
+        let (registry, _, _) = parse_image_ref(image)?;
+        let auth = self.credentials.get(&registry).map(|(username, password)| {
+            bollard::auth::DockerCredentials {
+                username: Some(username.clone()),
+                password: Some(password.clone()),
+                serveraddress: Some(registry.clone()),
+                ..Default::default()
+            }
+        });
+
+        let (from_image, tag) = match image.rfind(':') {
+            Some(i) => (&image[..i], &image[i + 1..]),
+            None => (image, "latest"),
+        };
+
+        info!("Pulling image {}", image);
+        let mut stream = self.docker.create_image(
+            Some(CreateImageOptions { from_image, tag, ..Default::default() }),
+            None,
+            auth,
+        );
+        while let Some(result) = stream.next().await {
+            result?;
+        }
+        Ok(())
+    }
+
+    pub async fn recreate_container(&self, container_id: &str) -> Result<()> {
+        use bollard::container::{
+            Config, CreateContainerOptions, RemoveContainerOptions, StopContainerOptions,
+        };
+        use bollard::models::EndpointSettings;
+        use bollard::network::ConnectNetworkOptions;
+
+        let info = self.docker.inspect_container(container_id, None).await?;
+        let name = info
+            .name
+            .as_deref()
+            .unwrap_or("")
+            .trim_start_matches('/')
+            .to_string();
+
+        let container_config = info
+            .config
+            .clone()
+            .ok_or_else(|| anyhow!("No config in inspect response for {}", name))?;
+
+        let primary_network = info
+            .host_config
+            .as_ref()
+            .and_then(|hc| hc.network_mode.clone())
+            .unwrap_or_else(|| "bridge".to_string());
+
+        // Collect any networks beyond the primary one — connect to these after recreation
+        let extra_networks: Vec<String> = info
+            .network_settings
+            .as_ref()
+            .and_then(|ns| ns.networks.as_ref())
+            .map(|nets| {
+                nets.keys()
+                    .filter(|n| {
+                        !matches!(n.as_str(), "bridge" | "host" | "none")
+                            && **n != primary_network
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        info!("Stopping container {}", name);
+        self.docker
+            .stop_container(container_id, Some(StopContainerOptions { t: 10 }))
+            .await?;
+
+        info!("Removing container {}", name);
+        self.docker
+            .remove_container(
+                container_id,
+                Some(RemoveContainerOptions { force: false, v: false, link: false }),
+            )
+            .await?;
+
+        let create_config = Config {
+            hostname: container_config.hostname,
+            domainname: container_config.domainname,
+            user: container_config.user,
+            attach_stdin: container_config.attach_stdin,
+            attach_stdout: container_config.attach_stdout,
+            attach_stderr: container_config.attach_stderr,
+            exposed_ports: container_config.exposed_ports,
+            tty: container_config.tty,
+            open_stdin: container_config.open_stdin,
+            stdin_once: container_config.stdin_once,
+            env: container_config.env,
+            cmd: container_config.cmd,
+            image: container_config.image,
+            volumes: container_config.volumes,
+            working_dir: container_config.working_dir,
+            entrypoint: container_config.entrypoint,
+            labels: container_config.labels,
+            stop_signal: container_config.stop_signal,
+            stop_timeout: container_config.stop_timeout,
+            host_config: info.host_config,
+            ..Default::default()
+        };
+
+        info!("Creating container {}", name);
+        let created = self
+            .docker
+            .create_container(
+                Some(CreateContainerOptions::<String> {
+                    name: name.clone(),
+                    platform: None,
+                }),
+                create_config,
+            )
+            .await?;
+
+        for network_name in &extra_networks {
+            info!("Connecting {} to network {}", name, network_name);
+            self.docker
+                .connect_network(
+                    network_name,
+                    ConnectNetworkOptions::<String> {
+                        container: created.id.clone(),
+                        endpoint_config: EndpointSettings::default(),
+                    },
+                )
+                .await?;
+        }
+
+        info!("Starting container {}", name);
+        self.docker
+            .start_container::<String>(&created.id, None)
+            .await?;
+
+        Ok(())
     }
 }
 

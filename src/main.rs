@@ -106,15 +106,7 @@ impl Rawrr {
         }
         
         debug!("Starting poll cycle");
-        
-        // In a real implementation, you would:
-        // 1. List all running containers from Docker
-        // 2. Check their labels
-        // 3. Query the registry for latest image digests
-        // 4. Compare with state
-        // 5. Handle upgrades based on labels
-        
-        // For now, this is a skeleton that shows the flow
+
         let containers = match self.docker_client.list_containers().await {
             Ok(containers) => containers,
             Err(e) => {
@@ -192,7 +184,31 @@ impl Rawrr {
                         &digest,
                         self.config.get_release_delay(),
                     ) {
-                        self.handle_upgrade(&service_name, &old_digest, &digest, policy).await;
+                        let already_current = if !container.image_id.is_empty() {
+                            match self.docker_client.get_local_image_digest(&container.image_id).await {
+                                Ok(Some(ref local)) => local == &digest,
+                                Ok(None) => false,
+                                Err(e) => {
+                                    warn!("Could not read local image digest for {}: {}", service_name, e);
+                                    false
+                                }
+                            }
+                        } else {
+                            false
+                        };
+
+                        if already_current {
+                            debug!("{} is already running {}, skipping upgrade", service_name, short_digest(&digest));
+                        } else {
+                            self.handle_upgrade(
+                                &service_name,
+                                &container.id,
+                                &container.image,
+                                &old_digest,
+                                &digest,
+                                policy,
+                            ).await;
+                        }
                     }
                 }
                 Err(e) => {
@@ -210,6 +226,8 @@ impl Rawrr {
     async fn handle_upgrade(
         &mut self,
         service_name: &str,
+        container_id: &str,
+        image: &str,
         old_digest: &str,
         new_digest: &str,
         policy: ContainerPolicy,
@@ -224,21 +242,20 @@ impl Rawrr {
                 NotificationAction::NotifyOnly
             },
         };
-        
-        // Send notification
+
         if let Err(e) = Notifier::send(&self.config.notifier, &notification).await {
-            error!("Failed to send notification: {}", e);
+            error!("Failed to send notification for {}: {}", service_name, e);
         }
-        
-        // Perform upgrade if needed
+
         if notification.action == NotificationAction::Update {
-            info!("Upgrading container: {}", service_name);
-            // TODO: Implement actual container upgrade
-            // This would involve:
-            // - Pulling the new image
-            // - Stopping the current container
-            // - Starting a new one with the same config
-            // - Or using docker-compose if available
+            info!("Upgrading {}", service_name);
+            if let Err(e) = self.docker_client.pull_image(image).await {
+                error!("Failed to pull image for {}: {}", service_name, e);
+                return;
+            }
+            if let Err(e) = self.docker_client.recreate_container(container_id).await {
+                error!("Failed to recreate container {}: {}", service_name, e);
+            }
         }
     }
     

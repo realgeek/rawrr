@@ -921,6 +921,7 @@ dependencies = [
  "bollard",
  "chrono",
  "dotenv",
+ "futures-util",
  "reqwest",
  "serde",
  "serde_json",
