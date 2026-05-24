@@ -16,8 +16,8 @@ pub struct Container {
     pub labels: HashMap<String, String>,
 }
 
-// Keyed by "realm|service". The scope is per-image but anonymous tokens are
-// valid for any repo on that registry, so we only need one token per endpoint.
+// Keyed by "realm|service|scope". Docker Hub scopes anonymous tokens to the
+// specific repository requested, so a token for repo A is rejected for repo B.
 struct TokenCache(Mutex<HashMap<String, (String, Instant)>>);
 
 impl TokenCache {
@@ -137,7 +137,7 @@ impl DockerClient {
             let (realm, service, scope) = parse_www_authenticate(&www_auth)
                 .ok_or_else(|| anyhow!("Could not parse WWW-Authenticate: {}", www_auth))?;
 
-            let cache_key = format!("{}|{}", realm, service);
+            let cache_key = format!("{}|{}|{}", realm, service, scope);
 
             let token = match self.token_cache.get(&cache_key) {
                 Some(t) => {
