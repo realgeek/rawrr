@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
@@ -44,20 +45,32 @@ impl Rawrr {
     
     pub async fn run(&mut self) -> Result<()> {
         info!("Rawrr starting (meow 🐾)");
-        
-        // Initial startup delay
+
+        let mut sigterm = signal(SignalKind::terminate())?;
+        let mut sigint = signal(SignalKind::interrupt())?;
+
         info!(
             "Waiting {} seconds before first poll...",
             self.config.startup_delay_secs
         );
-        sleep(Duration::from_secs(self.config.startup_delay_secs)).await;
-        
+
+        tokio::select! {
+            _ = sleep(Duration::from_secs(self.config.startup_delay_secs)) => {}
+            _ = sigterm.recv() => { info!("Received SIGTERM, shutting down"); return Ok(()); }
+            _ = sigint.recv() =>  { info!("Received SIGINT, shutting down");  return Ok(()); }
+        }
+
         loop {
             self.poll_and_upgrade().await;
-            
-            // Sleep before next poll
-            sleep(Duration::from_secs(self.config.poll_interval_secs)).await;
+
+            tokio::select! {
+                _ = sleep(Duration::from_secs(self.config.poll_interval_secs)) => {}
+                _ = sigterm.recv() => { info!("Received SIGTERM, shutting down"); break; }
+                _ = sigint.recv() =>  { info!("Received SIGINT, shutting down");  break; }
+            }
         }
+
+        Ok(())
     }
     
     async fn poll_and_upgrade(&mut self) {

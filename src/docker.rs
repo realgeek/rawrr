@@ -16,6 +16,7 @@ pub struct Container {
 
 pub struct DockerClient {
     docker: Docker,
+    client: reqwest::Client,
 }
 
 impl DockerClient {
@@ -26,7 +27,10 @@ impl DockerClient {
         } else {
             Docker::connect_with_http(docker_host, 120, bollard::API_DEFAULT_VERSION)?
         };
-        Ok(DockerClient { docker })
+        Ok(DockerClient {
+            docker,
+            client: reqwest::Client::new(),
+        })
     }
 
     pub async fn list_containers(&self) -> Result<Vec<Container>> {
@@ -65,12 +69,107 @@ impl DockerClient {
     pub async fn get_image_digest(&self, image_ref: &str) -> Result<String> {
         debug!("Getting image digest for: {}", image_ref);
         let (registry, repository, tag) = parse_image_ref(image_ref)?;
-        match registry.as_str() {
-            "docker.io" | "" => get_docker_hub_digest(&repository, &tag).await,
-            "ghcr.io" => get_github_digest(&repository, &tag).await,
-            _ => get_generic_digest(&registry, &repository, &tag).await,
+
+        let (url, accept) = match registry.as_str() {
+            "docker.io" | "" => (
+                format!("https://registry-1.docker.io/v2/{}/manifests/{}", repository, tag),
+                "application/vnd.docker.distribution.manifest.v2+json",
+            ),
+            "ghcr.io" => (
+                format!("https://ghcr.io/v2/{}/manifests/{}", repository, tag),
+                "application/vnd.oci.image.manifest.v1+json",
+            ),
+            _ => (
+                format!("https://{}/v2/{}/manifests/{}", registry, repository, tag),
+                "application/vnd.oci.image.manifest.v1+json",
+            ),
+        };
+
+        get_manifest_digest(&self.client, &url, accept).await
+    }
+}
+
+// Fetches a manifest digest, handling the standard OCI Bearer token challenge.
+// All OCI-compliant registries (Docker Hub, GHCR, etc.) return 401 on the first
+// request with a WWW-Authenticate header pointing to their token endpoint.
+async fn get_manifest_digest(client: &reqwest::Client, url: &str, accept: &str) -> Result<String> {
+    let response = client.head(url).header("Accept", accept).send().await?;
+
+    let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        let www_auth = response
+            .headers()
+            .get("WWW-Authenticate")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("401 with no WWW-Authenticate header"))?;
+
+        let (realm, service, scope) = parse_www_authenticate(&www_auth)
+            .ok_or_else(|| anyhow!("Could not parse WWW-Authenticate: {}", www_auth))?;
+
+        let token = fetch_bearer_token(client, &realm, &service, &scope).await?;
+
+        client
+            .head(url)
+            .header("Accept", accept)
+            .header("Authorization", format!("Bearer {}", token))
+            .send()
+            .await?
+    } else {
+        response
+    };
+
+    if !response.status().is_success() {
+        return Err(anyhow!("Registry request failed: {}", response.status()));
+    }
+
+    response
+        .headers()
+        .get("Docker-Content-Digest")
+        .and_then(|h| h.to_str().ok())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("No Docker-Content-Digest header in response"))
+}
+
+async fn fetch_bearer_token(
+    client: &reqwest::Client,
+    realm: &str,
+    service: &str,
+    scope: &str,
+) -> Result<String> {
+    let mut url = reqwest::Url::parse(realm)?;
+    {
+        let mut q = url.query_pairs_mut();
+        if !service.is_empty() {
+            q.append_pair("service", service);
+        }
+        if !scope.is_empty() {
+            q.append_pair("scope", scope);
         }
     }
+
+    let body: serde_json::Value = client.get(url).send().await?.json().await?;
+
+    body.get("token")
+        .or_else(|| body.get("access_token"))
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow!("No token field in auth response"))
+}
+
+fn parse_www_authenticate(header: &str) -> Option<(String, String, String)> {
+    let params = header.strip_prefix("Bearer ")?;
+    let realm = extract_quoted_param(params, "realm")?;
+    let service = extract_quoted_param(params, "service").unwrap_or_default();
+    let scope = extract_quoted_param(params, "scope").unwrap_or_default();
+    Some((realm, service, scope))
+}
+
+fn extract_quoted_param(params: &str, key: &str) -> Option<String> {
+    let needle = format!("{}=\"", key);
+    let start = params.find(&needle)? + needle.len();
+    let rest = &params[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
 }
 
 fn parse_image_ref(image: &str) -> Result<(String, String, String)> {
@@ -93,69 +192,6 @@ fn parse_image_ref(image: &str) -> Result<(String, String, String)> {
     };
 
     Ok((registry, repo, tag))
-}
-
-async fn get_docker_hub_digest(repository: &str, tag: &str) -> Result<String> {
-    let url = format!("https://registry.hub.docker.com/v2/{}/manifests/{}", repository, tag);
-    let client = reqwest::Client::new();
-    let response = client
-        .head(&url)
-        .header("Accept", "application/vnd.docker.distribution.manifest.v2+json")
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        return Err(anyhow!("Failed to get Docker Hub digest: {}", response.status()));
-    }
-
-    response
-        .headers()
-        .get("Docker-Content-Digest")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("No Docker-Content-Digest header found"))
-}
-
-async fn get_github_digest(repository: &str, tag: &str) -> Result<String> {
-    let url = format!("https://ghcr.io/v2/{}/manifests/{}", repository, tag);
-    let client = reqwest::Client::new();
-    let response = client
-        .head(&url)
-        .header("Accept", "application/vnd.oci.image.manifest.v1+json")
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        return Err(anyhow!("Failed to get GHCR digest: {}", response.status()));
-    }
-
-    response
-        .headers()
-        .get("Docker-Content-Digest")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("No Docker-Content-Digest header found"))
-}
-
-async fn get_generic_digest(registry: &str, repository: &str, tag: &str) -> Result<String> {
-    let url = format!("https://{}/v2/{}/manifests/{}", registry, repository, tag);
-    let client = reqwest::Client::new();
-    let response = client
-        .head(&url)
-        .header("Accept", "application/vnd.oci.image.manifest.v1+json")
-        .send()
-        .await?;
-
-    if !response.status().is_success() {
-        return Err(anyhow!("Failed to get digest from {}: {}", registry, response.status()));
-    }
-
-    response
-        .headers()
-        .get("Docker-Content-Digest")
-        .and_then(|h| h.to_str().ok())
-        .map(|s| s.to_string())
-        .ok_or_else(|| anyhow!("No Docker-Content-Digest header found"))
 }
 
 #[cfg(test)]
@@ -192,5 +228,14 @@ mod tests {
         assert_eq!(reg, "ghcr.io");
         assert_eq!(repo, "myorg/myapp");
         assert_eq!(tag, "latest");
+    }
+
+    #[test]
+    fn test_parse_www_authenticate() {
+        let header = r#"Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/nginx:pull""#;
+        let (realm, service, scope) = parse_www_authenticate(header).unwrap();
+        assert_eq!(realm, "https://auth.docker.io/token");
+        assert_eq!(service, "registry.docker.io");
+        assert_eq!(scope, "repository:library/nginx:pull");
     }
 }
