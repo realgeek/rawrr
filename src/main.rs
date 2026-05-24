@@ -18,6 +18,13 @@ use notifier::{Notification, NotificationAction, Notifier};
 use rate_limiter::RateLimiter;
 use state::RawrrState;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ContainerPolicy {
+    Ignore,
+    Notify,
+    Update,
+}
+
 pub struct Rawrr {
     config: Config,
     docker_client: DockerClient,
@@ -106,44 +113,43 @@ impl Rawrr {
         
         // Process each container
         for container in containers {
-            if self.should_ignore(&container.labels) {
-                debug!("Ignoring container: {}", container.id);
-                continue;
-            }
-            
+            let policy = match self.get_container_policy(&container.labels) {
+                Some(ContainerPolicy::Ignore) => {
+                    debug!("Ignoring container: {}", container.id);
+                    continue;
+                }
+                None => {
+                    debug!("No policy label on container {}, skipping", container.id);
+                    continue;
+                }
+                Some(p) => p,
+            };
+
             let service_name = container
                 .names
                 .first()
                 .unwrap_or(&container.id)
                 .trim_start_matches('/')
                 .to_string();
-            
+
             match self.docker_client.get_image_digest(&container.image).await {
                 Ok(digest) => {
-                    debug!(
-                        "Container {} has image digest: {}",
-                        service_name, digest
-                    );
-                    
+                    debug!("Container {} has image digest: {}", service_name, digest);
+
                     let old_digest = self.state.services
                         .get(&service_name)
                         .and_then(|s| s.image.as_ref())
                         .map(|img| img.digest.clone())
                         .unwrap_or_default();
-                    
-                    let digest_changed = old_digest != digest;
-                    
-                    // Update state with new digest
+
                     self.state.update_service_image(service_name.clone(), digest.clone());
-                    
-                    // Check if we should upgrade
+
                     if self.state.should_upgrade(
                         &service_name,
                         &digest,
                         self.config.get_release_delay(),
                     ) {
-                        self.handle_upgrade(&service_name, &old_digest, &digest, &container.labels)
-                            .await;
+                        self.handle_upgrade(&service_name, &old_digest, &digest, policy).await;
                     }
                 }
                 Err(e) => {
@@ -163,13 +169,13 @@ impl Rawrr {
         service_name: &str,
         old_digest: &str,
         new_digest: &str,
-        labels: &HashMap<String, String>,
+        policy: ContainerPolicy,
     ) {
         let notification = Notification {
             service_name: service_name.to_string(),
             old_digest: old_digest.to_string(),
             new_digest: new_digest.to_string(),
-            action: if self.should_update(labels) {
+            action: if policy == ContainerPolicy::Update {
                 NotificationAction::Update
             } else {
                 NotificationAction::NotifyOnly
@@ -193,18 +199,16 @@ impl Rawrr {
         }
     }
     
-    fn should_ignore(&self, labels: &HashMap<String, String>) -> bool {
-        labels
-            .get(&self.config.label_ignore)
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false)
-    }
-    
-    fn should_update(&self, labels: &HashMap<String, String>) -> bool {
-        labels
-            .get(&self.config.label_update)
-            .map(|v| v.to_lowercase() == "true")
-            .unwrap_or(false)
+    fn get_container_policy(&self, labels: &HashMap<String, String>) -> Option<ContainerPolicy> {
+        match labels.get(&self.config.label_policy)?.to_lowercase().as_str() {
+            "ignore" | "false" | "off" => Some(ContainerPolicy::Ignore),
+            "notify" => Some(ContainerPolicy::Notify),
+            "update" => Some(ContainerPolicy::Update),
+            other => {
+                warn!("Unrecognised policy value {:?}, skipping container", other);
+                None
+            }
+        }
     }
 }
 

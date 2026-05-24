@@ -21,10 +21,8 @@ pub struct Config {
     /// Docker socket or remote endpoint
     pub docker_host: String,
     
-    /// Container labels that determine behavior
-    pub label_ignore: String,
-    pub label_notify: String,
-    pub label_update: String,
+    /// Container label that controls monitoring policy
+    pub label_policy: String,
     
     /// Notification settings
     pub notifier: NotifierConfig,
@@ -74,14 +72,8 @@ impl Config {
         let docker_host = env::var("DOCKER_HOST")
             .unwrap_or_else(|_| "unix:///var/run/docker.sock".to_string());
         
-        let label_ignore = env::var("RAWRR_LABEL_IGNORE")
-            .unwrap_or_else(|_| "rawrr.ignore".to_string());
-        
-        let label_notify = env::var("RAWRR_LABEL_NOTIFY")
-            .unwrap_or_else(|_| "rawrr.notify".to_string());
-        
-        let label_update = env::var("RAWRR_LABEL_UPDATE")
-            .unwrap_or_else(|_| "rawrr.update".to_string());
+        let label_policy = env::var("RAWRR_LABEL_POLICY")
+            .unwrap_or_else(|_| "rawrr.policy".to_string());
         
         let notifier = match env::var("RAWRR_NOTIFIER").as_deref() {
             Ok("gotify") => {
@@ -123,9 +115,7 @@ impl Config {
             poll_interval_secs,
             release_delay_hours,
             docker_host,
-            label_ignore,
-            label_notify,
-            label_update,
+            label_policy,
             notifier,
             rate_limit_check_interval_secs,
             rate_limit_max_polls,
