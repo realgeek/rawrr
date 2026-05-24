@@ -70,30 +70,33 @@ impl DockerClient {
         debug!("Getting image digest for: {}", image_ref);
         let (registry, repository, tag) = parse_image_ref(image_ref)?;
 
-        let (url, accept) = match registry.as_str() {
-            "docker.io" | "" => (
-                format!("https://registry-1.docker.io/v2/{}/manifests/{}", repository, tag),
-                "application/vnd.docker.distribution.manifest.v2+json",
-            ),
-            "ghcr.io" => (
-                format!("https://ghcr.io/v2/{}/manifests/{}", repository, tag),
-                "application/vnd.oci.image.manifest.v1+json",
-            ),
-            _ => (
-                format!("https://{}/v2/{}/manifests/{}", registry, repository, tag),
-                "application/vnd.oci.image.manifest.v1+json",
-            ),
+        let url = match registry.as_str() {
+            "docker.io" | "" => {
+                format!("https://registry-1.docker.io/v2/{}/manifests/{}", repository, tag)
+            }
+            _ => format!("https://{}/v2/{}/manifests/{}", registry, repository, tag),
         };
 
-        get_manifest_digest(&self.client, &url, accept).await
+        get_manifest_digest(&self.client, &url).await
     }
 }
 
+// Accepts all OCI and Docker manifest types so multi-platform image indexes
+// (application/vnd.oci.image.index.v1+json) are returned alongside single-arch
+// manifests. Registries like lscr.io return 404 if you request only the
+// single-arch type for an image that is stored as an index.
+const ACCEPT_MANIFESTS: &str = concat!(
+    "application/vnd.oci.image.index.v1+json,",
+    "application/vnd.oci.image.manifest.v1+json,",
+    "application/vnd.docker.distribution.manifest.list.v2+json,",
+    "application/vnd.docker.distribution.manifest.v2+json"
+);
+
 // Fetches a manifest digest, handling the standard OCI Bearer token challenge.
-// All OCI-compliant registries (Docker Hub, GHCR, etc.) return 401 on the first
-// request with a WWW-Authenticate header pointing to their token endpoint.
-async fn get_manifest_digest(client: &reqwest::Client, url: &str, accept: &str) -> Result<String> {
-    let response = client.head(url).header("Accept", accept).send().await?;
+// All OCI-compliant registries (Docker Hub, GHCR, lscr.io, etc.) return 401 on
+// the first request with a WWW-Authenticate header pointing to their token endpoint.
+async fn get_manifest_digest(client: &reqwest::Client, url: &str) -> Result<String> {
+    let response = client.head(url).header("Accept", ACCEPT_MANIFESTS).send().await?;
 
     let response = if response.status() == reqwest::StatusCode::UNAUTHORIZED {
         let www_auth = response
@@ -110,7 +113,7 @@ async fn get_manifest_digest(client: &reqwest::Client, url: &str, accept: &str) 
 
         client
             .head(url)
-            .header("Accept", accept)
+            .header("Accept", ACCEPT_MANIFESTS)
             .header("Authorization", format!("Bearer {}", token))
             .send()
             .await?
