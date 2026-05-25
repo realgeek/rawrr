@@ -101,6 +101,17 @@ impl RawrrState {
         });
     }
     
+    /// Called after a container is successfully recreated. Resets first_seen to now
+    /// so the release-delay window restarts and should_upgrade returns false until
+    /// the next new digest appears.
+    pub fn mark_upgraded(&mut self, service_name: &str) {
+        if let Some(service) = self.services.get_mut(service_name) {
+            if let Some(image) = &mut service.image {
+                image.first_seen = Utc::now();
+            }
+        }
+    }
+
     pub fn should_upgrade(
         &self,
         service_name: &str,

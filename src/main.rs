@@ -308,11 +308,17 @@ impl Rawrr {
                     Some(spec) => {
                         if let Err(e) = self.docker_client.create_and_start(spec).await {
                             error!("Failed to start {}: {}", u.service_name, e);
+                        } else {
+                            self.state.mark_upgraded(&u.service_name);
                         }
                     }
                     None => error!("No spec for {}, skipping start", u.service_name),
                 }
             }
+        }
+
+        if let Err(e) = self.state.save(&self.config.state_file) {
+            error!("Failed to save state after upgrades: {}", e);
         }
     }
     
