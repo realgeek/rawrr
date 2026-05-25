@@ -105,4 +105,30 @@ mod tests {
         limiter.record_poll();
         assert!(!limiter.can_poll());
     }
+
+    #[test]
+    fn test_seconds_until_next_poll_empty_queue() {
+        let limiter = RateLimiter::new(10, 60);
+        assert_eq!(limiter.seconds_until_next_poll(), 0);
+    }
+
+    #[test]
+    fn test_seconds_until_next_poll_after_record() {
+        let limiter = RateLimiter::new(10, 60);
+        limiter.record_poll();
+        // Should be somewhere between 0 and 60 seconds
+        let secs = limiter.seconds_until_next_poll();
+        assert!(secs <= 60);
+    }
+
+    #[test]
+    fn test_clone_shares_state() {
+        let limiter = RateLimiter::new(3, 60);
+        let clone = limiter.clone();
+        limiter.record_poll();
+        clone.record_poll();
+        clone.record_poll();
+        // 3 polls recorded across both handles — limit is reached
+        assert!(!limiter.can_poll());
+    }
 }

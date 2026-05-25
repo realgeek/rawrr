@@ -327,14 +327,18 @@ impl Rawrr {
     }
     
     fn get_container_policy(&self, labels: &HashMap<String, String>) -> Option<ContainerPolicy> {
-        match labels.get(&self.config.label_policy)?.to_lowercase().as_str() {
-            "ignore" | "false" | "off" => Some(ContainerPolicy::Ignore),
-            "notify" => Some(ContainerPolicy::Notify),
-            "update" => Some(ContainerPolicy::Update),
-            other => {
-                warn!("Unrecognised policy value {:?}, skipping container", other);
-                None
-            }
+        resolve_policy(labels.get(&self.config.label_policy)?)
+    }
+}
+
+fn resolve_policy(label_value: &str) -> Option<ContainerPolicy> {
+    match label_value.to_lowercase().as_str() {
+        "ignore" | "false" | "off" => Some(ContainerPolicy::Ignore),
+        "notify" => Some(ContainerPolicy::Notify),
+        "update" => Some(ContainerPolicy::Update),
+        other => {
+            warn!("Unrecognised policy value {:?}, skipping container", other);
+            None
         }
     }
 }
@@ -413,6 +417,146 @@ fn short_digest(digest: &str) -> &str {
     let hash_start = digest.find(':').map(|i| i + 1).unwrap_or(0);
     let end = (hash_start + 12).min(digest.len());
     &digest[..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn labels(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    fn make_upgrade(name: &str, depends_on: Vec<&str>) -> PendingUpgrade {
+        PendingUpgrade {
+            service_name: name.to_string(),
+            container_id: String::new(),
+            image: String::new(),
+            old_digest: String::new(),
+            new_digest: String::new(),
+            policy: ContainerPolicy::Update,
+            compose_project: None,
+            depends_on: depends_on.into_iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    // --- resolve_policy ---
+
+    #[test]
+    fn test_resolve_policy_update() {
+        assert_eq!(resolve_policy("update"), Some(ContainerPolicy::Update));
+    }
+
+    #[test]
+    fn test_resolve_policy_notify() {
+        assert_eq!(resolve_policy("notify"), Some(ContainerPolicy::Notify));
+    }
+
+    #[test]
+    fn test_resolve_policy_ignore_variants() {
+        assert_eq!(resolve_policy("ignore"), Some(ContainerPolicy::Ignore));
+        assert_eq!(resolve_policy("false"), Some(ContainerPolicy::Ignore));
+        assert_eq!(resolve_policy("off"), Some(ContainerPolicy::Ignore));
+    }
+
+    #[test]
+    fn test_resolve_policy_case_insensitive() {
+        assert_eq!(resolve_policy("UPDATE"), Some(ContainerPolicy::Update));
+        assert_eq!(resolve_policy("Notify"), Some(ContainerPolicy::Notify));
+        assert_eq!(resolve_policy("IGNORE"), Some(ContainerPolicy::Ignore));
+    }
+
+    #[test]
+    fn test_resolve_policy_unrecognized() {
+        assert_eq!(resolve_policy("banana"), None);
+    }
+
+    // --- parse_depends_on ---
+
+    #[test]
+    fn test_parse_depends_on_compose_label() {
+        // Compose format: "svc:condition:required,..."
+        let l = labels(&[("com.docker.compose.depends_on", "db:service_started:true,redis:service_healthy:false")]);
+        assert_eq!(parse_depends_on(&l), vec!["db", "redis"]);
+    }
+
+    #[test]
+    fn test_parse_depends_on_rawrr_label() {
+        let l = labels(&[("rawrr.depends_on", "db, redis")]);
+        assert_eq!(parse_depends_on(&l), vec!["db", "redis"]);
+    }
+
+    #[test]
+    fn test_parse_depends_on_no_label() {
+        assert!(parse_depends_on(&labels(&[])).is_empty());
+    }
+
+    #[test]
+    fn test_parse_depends_on_compose_takes_precedence() {
+        let l = labels(&[
+            ("com.docker.compose.depends_on", "db:service_started:true"),
+            ("rawrr.depends_on", "redis"),
+        ]);
+        assert_eq!(parse_depends_on(&l), vec!["db"]);
+    }
+
+    // --- topological_sort ---
+
+    #[test]
+    fn test_topological_sort_single() {
+        let u = make_upgrade("app", vec![]);
+        let order = topological_sort(&[&u]);
+        assert_eq!(order, vec![0]);
+    }
+
+    #[test]
+    fn test_topological_sort_chain() {
+        // app depends on db; db has no deps — db (idx 1) must precede app (idx 0)
+        let app = make_upgrade("app", vec!["db"]);
+        let db = make_upgrade("db", vec![]);
+        let order = topological_sort(&[&app, &db]);
+        let db_pos = order.iter().position(|&i| i == 1).unwrap();
+        let app_pos = order.iter().position(|&i| i == 0).unwrap();
+        assert!(db_pos < app_pos, "db must start before app");
+    }
+
+    #[test]
+    fn test_topological_sort_independent() {
+        let a = make_upgrade("a", vec![]);
+        let b = make_upgrade("b", vec![]);
+        let order = topological_sort(&[&a, &b]);
+        assert_eq!(order.len(), 2);
+        assert!(order.contains(&0) && order.contains(&1));
+    }
+
+    #[test]
+    fn test_topological_sort_cycle_includes_all() {
+        let a = make_upgrade("a", vec!["b"]);
+        let b = make_upgrade("b", vec!["a"]);
+        let order = topological_sort(&[&a, &b]);
+        assert_eq!(order.len(), 2, "cycle must not drop nodes");
+    }
+
+    // --- short_digest ---
+
+    #[test]
+    fn test_short_digest_with_prefix() {
+        // "sha256:" = 7 chars; hash_start = 7; end = 19 → first 19 chars
+        let digest = "sha256:abcdefghijklmnopqrstuvwxyz";
+        assert_eq!(short_digest(digest), "sha256:abcdefghijkl");
+    }
+
+    #[test]
+    fn test_short_digest_without_prefix() {
+        let digest = "abcdefghijklmnopqrstuvwxyz";
+        assert_eq!(short_digest(digest), "abcdefghijkl");
+    }
+
+    #[test]
+    fn test_short_digest_short_input() {
+        let digest = "sha256:abc";
+        assert_eq!(short_digest(digest), digest);
+    }
 }
 
 #[tokio::main]

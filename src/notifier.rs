@@ -118,3 +118,36 @@ fn truncate_digest(digest: &str) -> String {
         digest.to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_truncate_digest_sha256_prefix() {
+        // "sha256:" = 7 chars, hash_start = 7, end = 7+12 = 19 < len → truncated
+        let digest = "sha256:abcdefghijklmnopqrstuvwxyz";
+        assert_eq!(truncate_digest(digest), "sha256:abcdefghijkl…");
+    }
+
+    #[test]
+    fn test_truncate_digest_no_colon() {
+        // No prefix: hash_start = 0, end = 12 < 26 → truncated
+        let digest = "abcdefghijklmnopqrstuvwxyz";
+        assert_eq!(truncate_digest(digest), "abcdefghijkl…");
+    }
+
+    #[test]
+    fn test_truncate_digest_short_input() {
+        // Short enough that end == len → returned unchanged
+        let digest = "sha256:abc";
+        assert_eq!(truncate_digest(digest), "sha256:abc");
+    }
+
+    #[test]
+    fn test_truncate_digest_exactly_12_hash_chars() {
+        // "sha256:" + exactly 12 hash chars = 19 chars total, end == len → no ellipsis
+        let digest = "sha256:abcdefghijkl";
+        assert_eq!(truncate_digest(digest), "sha256:abcdefghijkl");
+    }
+}

@@ -141,3 +141,138 @@ impl Default for RawrrState {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::DateTime;
+
+    #[test]
+    fn test_new_state_is_empty() {
+        let state = RawrrState::new();
+        assert!(state.services.is_empty());
+        assert_eq!(state.last_poll_time, DateTime::UNIX_EPOCH);
+    }
+
+    #[test]
+    fn test_update_new_image_sets_first_seen() {
+        let mut state = RawrrState::new();
+        let before = Utc::now();
+        state.update_service_image("svc".to_string(), "sha256:abc".to_string());
+        let after = Utc::now();
+
+        let img = state.services.get("svc").unwrap().image.as_ref().unwrap();
+        assert_eq!(img.digest, "sha256:abc");
+        assert!(img.first_seen >= before && img.first_seen <= after);
+    }
+
+    #[test]
+    fn test_update_same_image_preserves_first_seen() {
+        let mut state = RawrrState::new();
+        state.update_service_image("svc".to_string(), "sha256:abc".to_string());
+
+        let past = DateTime::UNIX_EPOCH;
+        state.services.get_mut("svc").unwrap().image.as_mut().unwrap().first_seen = past;
+
+        state.update_service_image("svc".to_string(), "sha256:abc".to_string());
+
+        let img = state.services.get("svc").unwrap().image.as_ref().unwrap();
+        assert_eq!(img.first_seen, past);
+    }
+
+    #[test]
+    fn test_update_different_image_resets_first_seen() {
+        let mut state = RawrrState::new();
+        state.update_service_image("svc".to_string(), "sha256:aaa".to_string());
+
+        let past = DateTime::UNIX_EPOCH;
+        state.services.get_mut("svc").unwrap().image.as_mut().unwrap().first_seen = past;
+
+        state.update_service_image("svc".to_string(), "sha256:bbb".to_string());
+
+        let img = state.services.get("svc").unwrap().image.as_ref().unwrap();
+        assert_ne!(img.first_seen, past);
+        assert_eq!(img.digest, "sha256:bbb");
+    }
+
+    #[test]
+    fn test_should_upgrade_unknown_service() {
+        let state = RawrrState::new();
+        assert!(!state.should_upgrade("no_such", "sha256:abc", chrono::Duration::zero()));
+    }
+
+    #[test]
+    fn test_should_upgrade_no_image() {
+        let mut state = RawrrState::new();
+        state.get_or_create_service("svc".to_string());
+        assert!(!state.should_upgrade("svc", "sha256:abc", chrono::Duration::zero()));
+    }
+
+    #[test]
+    fn test_should_upgrade_wrong_digest() {
+        let mut state = RawrrState::new();
+        state.update_service_image("svc".to_string(), "sha256:aaa".to_string());
+        assert!(!state.should_upgrade("svc", "sha256:different", chrono::Duration::zero()));
+    }
+
+    #[test]
+    fn test_should_upgrade_delay_not_elapsed() {
+        let mut state = RawrrState::new();
+        state.update_service_image("svc".to_string(), "sha256:abc".to_string());
+        // first_seen = now, so a 1-hour delay has not elapsed
+        assert!(!state.should_upgrade("svc", "sha256:abc", chrono::Duration::hours(1)));
+    }
+
+    #[test]
+    fn test_should_upgrade_delay_elapsed() {
+        let mut state = RawrrState::new();
+        state.update_service_image("svc".to_string(), "sha256:abc".to_string());
+        // first_seen to UNIX epoch so any positive delay has long elapsed
+        state.services.get_mut("svc").unwrap().image.as_mut().unwrap().first_seen =
+            DateTime::UNIX_EPOCH;
+        assert!(state.should_upgrade("svc", "sha256:abc", chrono::Duration::hours(6)));
+    }
+
+    #[test]
+    fn test_mark_upgraded_resets_first_seen() {
+        let mut state = RawrrState::new();
+        state.update_service_image("svc".to_string(), "sha256:abc".to_string());
+        state.services.get_mut("svc").unwrap().image.as_mut().unwrap().first_seen =
+            DateTime::UNIX_EPOCH;
+
+        let before = Utc::now();
+        state.mark_upgraded("svc");
+        let after = Utc::now();
+
+        let first_seen = state.services.get("svc").unwrap().image.as_ref().unwrap().first_seen;
+        assert!(first_seen >= before && first_seen <= after);
+    }
+
+    #[test]
+    fn test_mark_upgraded_nonexistent_is_noop() {
+        let mut state = RawrrState::new();
+        state.mark_upgraded("no_such_service"); // must not panic
+    }
+
+    #[test]
+    fn test_save_and_load_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let mut state = RawrrState::new();
+        state.update_service_image("myapp".to_string(), "sha256:deadbeef".to_string());
+        state.save(&path).unwrap();
+
+        let loaded = RawrrState::load(&path).unwrap();
+        let img = loaded.services.get("myapp").unwrap().image.as_ref().unwrap();
+        assert_eq!(img.digest, "sha256:deadbeef");
+    }
+
+    #[test]
+    fn test_load_nonexistent_returns_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nonexistent.json");
+        let state = RawrrState::load(&path).unwrap();
+        assert!(state.services.is_empty());
+    }
+}

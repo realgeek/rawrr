@@ -515,4 +515,61 @@ mod tests {
         assert_eq!(service, "registry.docker.io");
         assert_eq!(scope, "repository:library/nginx:pull");
     }
+
+    #[test]
+    fn test_parse_image_ref_registry_with_port() {
+        let (reg, repo, tag) = parse_image_ref("myregistry.example.com:5000/myapp:v2").unwrap();
+        assert_eq!(reg, "myregistry.example.com:5000");
+        assert_eq!(repo, "myapp");
+        assert_eq!(tag, "v2");
+    }
+
+    #[test]
+    fn test_parse_image_ref_user_scoped_no_registry() {
+        // "myorg/myapp" — first segment has no dot/colon, so it's docker.io
+        let (reg, repo, tag) = parse_image_ref("myorg/myapp").unwrap();
+        assert_eq!(reg, "docker.io");
+        assert_eq!(repo, "myorg/myapp");
+        assert_eq!(tag, "latest");
+    }
+
+    #[test]
+    fn test_parse_image_ref_implicit_latest() {
+        let (_, _, tag) = parse_image_ref("nginx").unwrap();
+        assert_eq!(tag, "latest");
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_missing_scope() {
+        let header = r#"Bearer realm="https://auth.example.com/token",service="registry.example.com""#;
+        let (realm, service, scope) = parse_www_authenticate(header).unwrap();
+        assert_eq!(realm, "https://auth.example.com/token");
+        assert_eq!(service, "registry.example.com");
+        assert_eq!(scope, "");
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_not_bearer() {
+        let header = r#"Basic realm="example""#;
+        assert!(parse_www_authenticate(header).is_none());
+    }
+
+    #[test]
+    fn test_extract_quoted_param_present() {
+        let params = r#"realm="https://example.com",service="svc""#;
+        assert_eq!(
+            extract_quoted_param(params, "realm"),
+            Some("https://example.com".to_string())
+        );
+        assert_eq!(
+            extract_quoted_param(params, "service"),
+            Some("svc".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_quoted_param_absent() {
+        let params = r#"realm="https://example.com""#;
+        assert_eq!(extract_quoted_param(params, "scope"), None);
+    }
 }
