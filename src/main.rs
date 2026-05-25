@@ -65,7 +65,11 @@ impl Rawrr {
         if self.config.dry_run {
             info!("Dry-run mode enabled — will log container policies and exit without hitting registries");
         }
-        info!("Rawrr starting (meow 🐾)");
+        info!(
+            "Rawrr v{} ({}) starting (meow 🐾)",
+            env!("CARGO_PKG_VERSION"),
+            env!("GIT_COMMIT_HASH"),
+        );
 
         let mut sigterm = signal(SignalKind::terminate())?;
         let mut sigint = signal(SignalKind::interrupt())?;
