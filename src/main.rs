@@ -194,34 +194,34 @@ impl Rawrr {
 
             debug!("Container {} has image digest: {}", service_name, short_digest(&digest));
 
-            let old_digest = self.state.services
-                .get(&service_name)
-                .and_then(|s| s.image.as_ref())
-                .map(|img| img.digest.clone())
-                .unwrap_or_default();
-
             self.state.update_service_image(service_name.clone(), digest.clone());
 
             if !self.state.should_upgrade(&service_name, &digest, self.config.get_release_delay()) {
                 continue;
             }
 
-            if !container.image_id.is_empty() {
+            let running_digest = if !container.image_id.is_empty() {
                 match self.docker_client.get_local_image_digest(&container.image_id).await {
-                    Ok(Some(ref local)) if local == &digest => {
-                        debug!("{} already running {}, skipping", service_name, short_digest(&digest));
-                        continue;
+                    Ok(d) => d,
+                    Err(e) => {
+                        warn!("Could not read local image digest for {}: {}", service_name, e);
+                        None
                     }
-                    Err(e) => warn!("Could not read local image digest for {}: {}", service_name, e),
-                    _ => {}
                 }
+            } else {
+                None
+            };
+
+            if running_digest.as_deref() == Some(digest.as_str()) {
+                debug!("{} already running {}, skipping", service_name, short_digest(&digest));
+                continue;
             }
 
             pending.push(PendingUpgrade {
                 service_name,
                 container_id: container.id.clone(),
                 image: container.image.clone(),
-                old_digest,
+                old_digest: running_digest.unwrap_or_default(),
                 new_digest: digest,
                 policy,
                 compose_project: container.labels.get("com.docker.compose.project").cloned(),
@@ -249,8 +249,12 @@ impl Rawrr {
                     NotificationAction::NotifyOnly
                 },
             };
-            if let Err(e) = Notifier::send(&self.config.notifier, &notification).await {
-                error!("Failed to send notification for {}: {}", upgrade.service_name, e);
+            match Notifier::send(&self.config.notifier, &notification).await {
+                Err(e) => error!("Failed to send notification for {}: {}", upgrade.service_name, e),
+                Ok(()) if upgrade.policy == ContainerPolicy::Notify => {
+                    self.state.mark_upgraded(&upgrade.service_name);
+                }
+                Ok(()) => {}
             }
         }
 
@@ -262,6 +266,9 @@ impl Rawrr {
             .collect();
 
         if update_indices.is_empty() {
+            if let Err(e) = self.state.save(&self.config.state_file) {
+                error!("Failed to save state: {}", e);
+            }
             return;
         }
 

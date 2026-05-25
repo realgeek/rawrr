@@ -275,4 +275,48 @@ mod tests {
         let state = RawrrState::load(&path).unwrap();
         assert!(state.services.is_empty());
     }
+
+    // Regression: Notify containers re-notified every poll once the release delay
+    // elapsed because mark_upgraded was never called after sending a Notify notification.
+    #[test]
+    fn test_mark_upgraded_suppresses_renotify() {
+        let mut state = RawrrState::new();
+        state.update_service_image("plex".to_string(), "sha256:abc123".to_string());
+        state.services.get_mut("plex").unwrap().image.as_mut().unwrap().first_seen =
+            DateTime::UNIX_EPOCH;
+
+        assert!(
+            state.should_upgrade("plex", "sha256:abc123", chrono::Duration::hours(6)),
+            "precondition: should_upgrade must be true before notification"
+        );
+
+        state.mark_upgraded("plex");
+
+        assert!(
+            !state.should_upgrade("plex", "sha256:abc123", chrono::Duration::hours(6)),
+            "should not re-notify on the next poll after mark_upgraded resets first_seen"
+        );
+    }
+
+    // Regression: the Notify-only early-return path skipped saving state, so the
+    // mark_upgraded reset was lost on process restart and the notification fired again.
+    #[test]
+    fn test_mark_upgraded_persists_across_save_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        let mut state = RawrrState::new();
+        state.update_service_image("plex".to_string(), "sha256:abc123".to_string());
+        state.services.get_mut("plex").unwrap().image.as_mut().unwrap().first_seen =
+            DateTime::UNIX_EPOCH;
+
+        state.mark_upgraded("plex");
+        state.save(&path).unwrap();
+
+        let reloaded = RawrrState::load(&path).unwrap();
+        assert!(
+            !reloaded.should_upgrade("plex", "sha256:abc123", chrono::Duration::hours(6)),
+            "should not re-notify after restart when state was saved post-notification"
+        );
+    }
 }
