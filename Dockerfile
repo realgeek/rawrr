@@ -4,13 +4,17 @@ WORKDIR /app
 
 # Compile dependencies as a separate layer so they are only rebuilt when
 # Cargo.toml or Cargo.lock changes, not on every source edit.
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 RUN mkdir src && echo "fn main() {}" > src/main.rs \
     && cargo build --release \
     && rm -rf src target/release/deps/rawrr*
 
 COPY src ./src
-RUN cargo build --release
+
+# Declared after the dep-caching layer so changing the hash only invalidates
+# the final compile, not the cached dependencies.
+ARG GIT_COMMIT_HASH=unknown
+RUN GIT_COMMIT_HASH=${GIT_COMMIT_HASH} cargo build --release
 
 FROM alpine:3.21
 RUN apk add --no-cache ca-certificates

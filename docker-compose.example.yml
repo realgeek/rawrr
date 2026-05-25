@@ -3,7 +3,10 @@ version: '3.8'
 services:
   # Example: Rawrr watching for updates
   rawrr:
-    build: .
+    build:
+      context: .
+      args:
+        GIT_COMMIT_HASH: ${GIT_COMMIT_HASH:-unknown}
     image: rawrr:latest
     container_name: rawrr
     environment:
