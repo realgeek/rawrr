@@ -196,7 +196,19 @@ impl Rawrr {
 
             self.state.update_service_image(service_name.clone(), digest.clone());
 
-            if !self.state.should_upgrade(&service_name, &digest, self.config.get_release_delay()) {
+            let due = match policy {
+                ContainerPolicy::Update => {
+                    self.state.should_upgrade(&service_name, &digest, self.config.get_release_delay())
+                }
+                ContainerPolicy::Notify => self.state.should_notify(
+                    &service_name,
+                    &digest,
+                    self.config.get_release_delay(),
+                    self.config.get_renotify_interval(),
+                ),
+                ContainerPolicy::Ignore => unreachable!("Ignore containers are skipped above"),
+            };
+            if !due {
                 continue;
             }
 
@@ -252,7 +264,7 @@ impl Rawrr {
             match Notifier::send(&self.config.notifier, &notification).await {
                 Err(e) => error!("Failed to send notification for {}: {}", upgrade.service_name, e),
                 Ok(()) if upgrade.policy == ContainerPolicy::Notify => {
-                    self.state.mark_upgraded(&upgrade.service_name);
+                    self.state.mark_notified(&upgrade.service_name);
                 }
                 Ok(()) => {}
             }

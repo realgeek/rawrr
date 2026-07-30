@@ -17,7 +17,11 @@ pub struct Config {
     
     /// Delay between image release and upgrade (in hours)
     pub release_delay_hours: i64,
-    
+
+    /// How often to re-send "update available" reminders for notify-policy
+    /// containers, once release_delay_hours has elapsed (in hours). 0 = every poll.
+    pub renotify_interval_hours: i64,
+
     /// Docker socket or remote endpoint
     pub docker_host: String,
     
@@ -72,7 +76,11 @@ impl Config {
         let release_delay_hours = env::var("RAWRR_RELEASE_DELAY_HOURS")
             .unwrap_or_else(|_| "6".to_string())
             .parse()?;
-        
+
+        let renotify_interval_hours = env::var("RAWRR_RENOTIFY_INTERVAL_HOURS")
+            .unwrap_or_else(|_| "24".to_string())
+            .parse()?;
+
         let docker_host = env::var("DOCKER_HOST")
             .unwrap_or_else(|_| "unix:///var/run/docker.sock".to_string());
         
@@ -123,6 +131,7 @@ impl Config {
             startup_delay_secs,
             poll_interval_secs,
             release_delay_hours,
+            renotify_interval_hours,
             docker_host,
             label_policy,
             notifier,
@@ -136,6 +145,10 @@ impl Config {
     
     pub fn get_release_delay(&self) -> Duration {
         Duration::hours(self.release_delay_hours)
+    }
+
+    pub fn get_renotify_interval(&self) -> Duration {
+        Duration::hours(self.renotify_interval_hours)
     }
 }
 
@@ -200,6 +213,7 @@ mod tests {
             startup_delay_secs: 0,
             poll_interval_secs: 3600,
             release_delay_hours: 6,
+            renotify_interval_hours: 24,
             docker_host: String::new(),
             label_policy: String::new(),
             notifier: NotifierConfig::None,
