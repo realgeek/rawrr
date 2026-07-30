@@ -9,6 +9,7 @@ A Rust-based Docker image update watcher that monitors your containers for new i
   - `rawrr.ignore=true` - Skip this container entirely
   - `rawrr.notify=true` - Send notifications only, no auto-upgrade
   - `rawrr.update=true` - Automatically pull and restart on update
+- **Configurable Renotify Interval**: For notify-only containers, control how often reminder notifications repeat (default: 24 hours) independently of the release delay
 - **Smart Polling**: Respects registry API rate limits and tracks poll history to avoid throttling
 - **Startup Delay**: Configurable delay before first poll (useful in orchestrated environments)
 - **Flexible Notifications**: Support for both Gotify and ntfy with easy future expansion
@@ -56,6 +57,7 @@ All configuration is done via environment variables:
 | `RAWRR_STARTUP_DELAY_SECS` | `30` | Seconds to wait before first poll |
 | `RAWRR_POLL_INTERVAL_SECS` | `3600` | Poll interval in seconds (1 hour) |
 | `RAWRR_RELEASE_DELAY_HOURS` | `6` | Hours to wait before upgrading after release |
+| `RAWRR_RENOTIFY_INTERVAL_HOURS` | `24` | Hours between repeat reminders for `rawrr.notify=true` containers (after the release delay has passed). `0` = remind on every poll |
 | `RAWRR_STATE_FILE` | `/var/lib/rawrr/state.json` | Path to state persistence file |
 
 ### Docker Settings
@@ -151,7 +153,23 @@ RAWRR_POLL_INTERVAL_SECS=3600  # Still poll hourly
 
 This polls hourly but only upgrades images released 24+ hours ago.
 
-### Example 4: ntfy Notifications
+### Example 4: Daily Reminders for Notify-Only Containers
+
+```yaml
+postgres:
+  image: postgres:15
+  labels:
+    rawrr.notify: "true"
+  environment:
+    POSTGRES_PASSWORD: "secret"
+```
+
+```bash
+RAWRR_RELEASE_DELAY_HOURS=6           # Wait 6 hours before the first reminder
+RAWRR_RENOTIFY_INTERVAL_HOURS=24      # Then remind once a day until it's updated
+```
+
+### Example 5: ntfy Notifications
 
 ```yaml
 services:
@@ -178,7 +196,7 @@ services:
 2. **Decision Phase** (same as polling):
    - Check if image first-seen time > `RAWRR_RELEASE_DELAY_HOURS`
    - If yes and container has `rawrr.update=true`, trigger upgrade
-   - Send notifications based on container labels
+   - If yes and container has `rawrr.notify=true`, send a reminder — repeating every `RAWRR_RENOTIFY_INTERVAL_HOURS` until the digest changes or the policy switches to `update`
 
 ### Example Timeline
 
@@ -211,7 +229,8 @@ Rawrr persists state as JSON for transparency and debugging:
       "image": {
         "digest": "sha256:abc123...",
         "first_seen": "2024-05-22T10:00:00.000000Z",
-        "last_checked": "2024-05-22T16:30:45.123456Z"
+        "last_checked": "2024-05-22T16:30:45.123456Z",
+        "last_notified": "2024-05-22T16:30:45.123456Z"
       }
     },
     "postgres-db": {
@@ -219,7 +238,8 @@ Rawrr persists state as JSON for transparency and debugging:
       "image": {
         "digest": "sha256:def456...",
         "first_seen": "2024-05-22T12:00:00.000000Z",
-        "last_checked": "2024-05-22T16:30:45.123456Z"
+        "last_checked": "2024-05-22T16:30:45.123456Z",
+        "last_notified": null
       }
     }
   }
