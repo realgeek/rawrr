@@ -17,7 +17,11 @@ pub struct Config {
     
     /// Delay between image release and upgrade (in hours)
     pub release_delay_hours: i64,
-    
+
+    /// How often to re-send "update available" reminders for notify-policy
+    /// containers, once release_delay_hours has elapsed (in hours). 0 = every poll.
+    pub renotify_interval_hours: i64,
+
     /// Docker socket or remote endpoint
     pub docker_host: String,
     
@@ -72,7 +76,11 @@ impl Config {
         let release_delay_hours = env::var("RAWRR_RELEASE_DELAY_HOURS")
             .unwrap_or_else(|_| "6".to_string())
             .parse()?;
-        
+
+        let renotify_interval_hours = env::var("RAWRR_RENOTIFY_INTERVAL_HOURS")
+            .unwrap_or_else(|_| "24".to_string())
+            .parse()?;
+
         let docker_host = env::var("DOCKER_HOST")
             .unwrap_or_else(|_| "unix:///var/run/docker.sock".to_string());
         
@@ -123,6 +131,7 @@ impl Config {
             startup_delay_secs,
             poll_interval_secs,
             release_delay_hours,
+            renotify_interval_hours,
             docker_host,
             label_policy,
             notifier,
@@ -137,12 +146,16 @@ impl Config {
     pub fn get_release_delay(&self) -> Duration {
         Duration::hours(self.release_delay_hours)
     }
+
+    pub fn get_renotify_interval(&self) -> Duration {
+        Duration::hours(self.renotify_interval_hours)
+    }
 }
 
 // Format: "docker.io=user:token,ghcr.io=user:ghp_token"
 // Splits on the first '=' and first ':' so passwords containing ':' are handled.
 // Commas and '=' are not supported in credentials themselves.
-fn parse_registry_credentials(s: &str) -> HashMap<String, (String, String)> {
+pub(crate) fn parse_registry_credentials(s: &str) -> HashMap<String, (String, String)> {
     s.split(',')
         .filter(|e| !e.is_empty())
         .filter_map(|entry| {
@@ -151,4 +164,65 @@ fn parse_registry_credentials(s: &str) -> HashMap<String, (String, String)> {
             Some((registry.to_string(), (user.to_string(), pass.to_string())))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_credentials_empty() {
+        assert!(parse_registry_credentials("").is_empty());
+    }
+
+    #[test]
+    fn test_parse_credentials_single() {
+        let creds = parse_registry_credentials("docker.io=user:token");
+        assert_eq!(creds.get("docker.io"), Some(&("user".to_string(), "token".to_string())));
+    }
+
+    #[test]
+    fn test_parse_credentials_multiple() {
+        let creds = parse_registry_credentials("docker.io=user:tok1,ghcr.io=alice:ghp_abc");
+        assert_eq!(creds.get("docker.io"), Some(&("user".to_string(), "tok1".to_string())));
+        assert_eq!(creds.get("ghcr.io"), Some(&("alice".to_string(), "ghp_abc".to_string())));
+        assert_eq!(creds.len(), 2);
+    }
+
+    #[test]
+    fn test_parse_credentials_password_with_colon() {
+        // Only the first ':' is the username/password separator
+        let creds = parse_registry_credentials("docker.io=user:pass:word");
+        assert_eq!(creds.get("docker.io"), Some(&("user".to_string(), "pass:word".to_string())));
+    }
+
+    #[test]
+    fn test_parse_credentials_missing_equals() {
+        assert!(parse_registry_credentials("docker.io").is_empty());
+    }
+
+    #[test]
+    fn test_parse_credentials_missing_colon() {
+        assert!(parse_registry_credentials("docker.io=useronly").is_empty());
+    }
+
+    #[test]
+    fn test_get_release_delay() {
+        let config = Config {
+            state_file: "/tmp/state.json".into(),
+            startup_delay_secs: 0,
+            poll_interval_secs: 3600,
+            release_delay_hours: 6,
+            renotify_interval_hours: 24,
+            docker_host: String::new(),
+            label_policy: String::new(),
+            notifier: NotifierConfig::None,
+            rate_limit_check_interval_secs: 60,
+            rate_limit_max_polls: 100,
+            rate_limit_window_secs: 3600,
+            registry_credentials: Default::default(),
+            dry_run: false,
+        };
+        assert_eq!(config.get_release_delay(), Duration::hours(6));
+    }
 }

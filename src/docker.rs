@@ -8,6 +8,14 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
 
+/// Everything needed to recreate a container, captured before it is stopped.
+#[derive(Clone)]
+pub struct ContainerSpec {
+    pub name: String,
+    config: bollard::container::Config<String>,
+    extra_networks: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Container {
     pub id: String,
@@ -245,12 +253,10 @@ impl DockerClient {
         Ok(())
     }
 
-    pub async fn recreate_container(&self, container_id: &str) -> Result<()> {
-        use bollard::container::{
-            Config, CreateContainerOptions, RemoveContainerOptions, StopContainerOptions,
-        };
-        use bollard::models::EndpointSettings;
-        use bollard::network::ConnectNetworkOptions;
+    /// Inspects a running container and captures everything needed to recreate it.
+    /// Must be called before the container is stopped.
+    pub async fn inspect_for_recreate(&self, container_id: &str) -> Result<ContainerSpec> {
+        use bollard::container::Config;
 
         let info = self.docker.inspect_container(container_id, None).await?;
         let name = info
@@ -260,7 +266,7 @@ impl DockerClient {
             .trim_start_matches('/')
             .to_string();
 
-        let container_config = info
+        let cc = info
             .config
             .clone()
             .ok_or_else(|| anyhow!("No config in inspect response for {}", name))?;
@@ -271,7 +277,6 @@ impl DockerClient {
             .and_then(|hc| hc.network_mode.clone())
             .unwrap_or_else(|| "bridge".to_string());
 
-        // Collect any networks beyond the primary one — connect to these after recreation
         let extra_networks: Vec<String> = info
             .network_settings
             .as_ref()
@@ -287,6 +292,36 @@ impl DockerClient {
             })
             .unwrap_or_default();
 
+        let config = Config {
+            hostname: cc.hostname,
+            domainname: cc.domainname,
+            user: cc.user,
+            attach_stdin: cc.attach_stdin,
+            attach_stdout: cc.attach_stdout,
+            attach_stderr: cc.attach_stderr,
+            exposed_ports: cc.exposed_ports,
+            tty: cc.tty,
+            open_stdin: cc.open_stdin,
+            stdin_once: cc.stdin_once,
+            env: cc.env,
+            cmd: cc.cmd,
+            image: cc.image,
+            volumes: cc.volumes,
+            working_dir: cc.working_dir,
+            entrypoint: cc.entrypoint,
+            labels: cc.labels,
+            stop_signal: cc.stop_signal,
+            stop_timeout: cc.stop_timeout,
+            host_config: info.host_config,
+            ..Default::default()
+        };
+
+        Ok(ContainerSpec { name, config, extra_networks })
+    }
+
+    pub async fn stop_and_remove(&self, container_id: &str, name: &str) -> Result<()> {
+        use bollard::container::{RemoveContainerOptions, StopContainerOptions};
+
         info!("Stopping container {}", name);
         self.docker
             .stop_container(container_id, Some(StopContainerOptions { t: 10 }))
@@ -300,44 +335,28 @@ impl DockerClient {
             )
             .await?;
 
-        let create_config = Config {
-            hostname: container_config.hostname,
-            domainname: container_config.domainname,
-            user: container_config.user,
-            attach_stdin: container_config.attach_stdin,
-            attach_stdout: container_config.attach_stdout,
-            attach_stderr: container_config.attach_stderr,
-            exposed_ports: container_config.exposed_ports,
-            tty: container_config.tty,
-            open_stdin: container_config.open_stdin,
-            stdin_once: container_config.stdin_once,
-            env: container_config.env,
-            cmd: container_config.cmd,
-            image: container_config.image,
-            volumes: container_config.volumes,
-            working_dir: container_config.working_dir,
-            entrypoint: container_config.entrypoint,
-            labels: container_config.labels,
-            stop_signal: container_config.stop_signal,
-            stop_timeout: container_config.stop_timeout,
-            host_config: info.host_config,
-            ..Default::default()
-        };
+        Ok(())
+    }
 
-        info!("Creating container {}", name);
+    pub async fn create_and_start(&self, spec: &ContainerSpec) -> Result<()> {
+        use bollard::container::CreateContainerOptions;
+        use bollard::models::EndpointSettings;
+        use bollard::network::ConnectNetworkOptions;
+
+        info!("Creating container {}", spec.name);
         let created = self
             .docker
             .create_container(
                 Some(CreateContainerOptions::<String> {
-                    name: name.clone(),
+                    name: spec.name.clone(),
                     platform: None,
                 }),
-                create_config,
+                spec.config.clone(),
             )
             .await?;
 
-        for network_name in &extra_networks {
-            info!("Connecting {} to network {}", name, network_name);
+        for network_name in &spec.extra_networks {
+            info!("Connecting {} to network {}", spec.name, network_name);
             self.docker
                 .connect_network(
                     network_name,
@@ -349,12 +368,18 @@ impl DockerClient {
                 .await?;
         }
 
-        info!("Starting container {}", name);
+        info!("Starting container {}", spec.name);
         self.docker
             .start_container::<String>(&created.id, None)
             .await?;
 
         Ok(())
+    }
+
+    pub async fn recreate_container(&self, container_id: &str) -> Result<()> {
+        let spec = self.inspect_for_recreate(container_id).await?;
+        self.stop_and_remove(container_id, &spec.name).await?;
+        self.create_and_start(&spec).await
     }
 }
 
@@ -489,5 +514,62 @@ mod tests {
         assert_eq!(realm, "https://auth.docker.io/token");
         assert_eq!(service, "registry.docker.io");
         assert_eq!(scope, "repository:library/nginx:pull");
+    }
+
+    #[test]
+    fn test_parse_image_ref_registry_with_port() {
+        let (reg, repo, tag) = parse_image_ref("myregistry.example.com:5000/myapp:v2").unwrap();
+        assert_eq!(reg, "myregistry.example.com:5000");
+        assert_eq!(repo, "myapp");
+        assert_eq!(tag, "v2");
+    }
+
+    #[test]
+    fn test_parse_image_ref_user_scoped_no_registry() {
+        // "myorg/myapp" — first segment has no dot/colon, so it's docker.io
+        let (reg, repo, tag) = parse_image_ref("myorg/myapp").unwrap();
+        assert_eq!(reg, "docker.io");
+        assert_eq!(repo, "myorg/myapp");
+        assert_eq!(tag, "latest");
+    }
+
+    #[test]
+    fn test_parse_image_ref_implicit_latest() {
+        let (_, _, tag) = parse_image_ref("nginx").unwrap();
+        assert_eq!(tag, "latest");
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_missing_scope() {
+        let header = r#"Bearer realm="https://auth.example.com/token",service="registry.example.com""#;
+        let (realm, service, scope) = parse_www_authenticate(header).unwrap();
+        assert_eq!(realm, "https://auth.example.com/token");
+        assert_eq!(service, "registry.example.com");
+        assert_eq!(scope, "");
+    }
+
+    #[test]
+    fn test_parse_www_authenticate_not_bearer() {
+        let header = r#"Basic realm="example""#;
+        assert!(parse_www_authenticate(header).is_none());
+    }
+
+    #[test]
+    fn test_extract_quoted_param_present() {
+        let params = r#"realm="https://example.com",service="svc""#;
+        assert_eq!(
+            extract_quoted_param(params, "realm"),
+            Some("https://example.com".to_string())
+        );
+        assert_eq!(
+            extract_quoted_param(params, "service"),
+            Some("svc".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_quoted_param_absent() {
+        let params = r#"realm="https://example.com""#;
+        assert_eq!(extract_quoted_param(params, "scope"), None);
     }
 }
